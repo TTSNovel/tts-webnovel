@@ -132,14 +132,15 @@ def _text_to_html(text: str) -> str:
     return "\n".join(f"<p>{html_module.escape(p)}</p>" for p in paragraphs)
 
 
-def extract_chapters(epub_path: str) -> list[Chapter]:
-    """Parse an epub file and return its chapters in spine (reading) order.
+# A chapter's own title/first line normally starts with this same marker
+# ("Chương N", "Chapter N") — used to tell a genuine (if short) chapter
+# apart from front matter (title/author/synopsis) that only got a generic
+# fallback title because it has no h1/h2 and no toc entry of its own.
+_STARTS_WITH_MARKER_RE = re.compile(r"^\s*(?:Chương|Chapter)\s*\d+", re.IGNORECASE)
+_GENERIC_FALLBACK_TITLE_RE = re.compile(r"^Chapter \d+$")
 
-    Uses the spine (not just iterating all ITEM_DOCUMENT items) so ordering
-    matches how a reader app would actually present the book, and skips
-    non-linear items (e.g. footnote/cover pages some epubs mark that way).
-    """
-    book = epub.read_epub(epub_path)
+
+def _extract_chapters_from_book(book: epub.EpubBook) -> list[Chapter]:
     toc_titles = _toc_titles_by_href(book.toc)
 
     chapters: list[Chapter] = []
@@ -168,6 +169,39 @@ def extract_chapters(epub_path: str) -> list[Chapter]:
             continue
 
         title = toc_titles.get(item.get_name()) or _fallback_title(html, len(chapters))
+        # The book's title/author/synopsis page has no toc entry and no
+        # heading of its own, so it lands here with a generic "Chapter N"
+        # placeholder — relabel it instead of letting it masquerade as a
+        # real chapter (and collide with the real "Chapter 1" right after).
+        if (
+            len(chapters) == 0
+            and _GENERIC_FALLBACK_TITLE_RE.match(title)
+            and not _STARTS_WITH_MARKER_RE.match(text)
+        ):
+            title = "Giới thiệu"
         chapters.append(Chapter(index=len(chapters), title=title, html=html, text=text))
 
     return chapters
+
+
+def extract_chapters(epub_path: str) -> list[Chapter]:
+    """Parse an epub file and return its chapters in spine (reading) order.
+
+    Uses the spine (not just iterating all ITEM_DOCUMENT items) so ordering
+    matches how a reader app would actually present the book, and skips
+    non-linear items (e.g. footnote/cover pages some epubs mark that way).
+    """
+    book = epub.read_epub(epub_path)
+    return _extract_chapters_from_book(book)
+
+
+def extract_book(epub_path: str) -> tuple[dict, list[Chapter]]:
+    """Like extract_chapters, but also returns {"title", "author"} from epub metadata."""
+    book = epub.read_epub(epub_path)
+    dc_title = book.get_metadata("DC", "title")
+    dc_creator = book.get_metadata("DC", "creator")
+    metadata = {
+        "title": dc_title[0][0] if dc_title else None,
+        "author": dc_creator[0][0] if dc_creator else None,
+    }
+    return metadata, _extract_chapters_from_book(book)
