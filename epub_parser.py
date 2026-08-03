@@ -71,6 +71,16 @@ def _clean_html_and_text(raw_bytes: bytes) -> tuple[str, str]:
     # Strip elements that carry no readable content.
     for tag in body.find_all(["script", "style"]):
         tag.decompose()
+    # Cross-document links (table-of-contents entries, "prev/next chapter"
+    # nav) are never real chapter prose — a novel doesn't hyperlink its own
+    # sentences. Left in, their link text ("Chương 9: ...", "Chương sau")
+    # bleeds into the extracted text and, worse, gets mistaken for real
+    # chapter-marker boundaries by _split_by_chapter_markers on TOC pages.
+    # Same-page anchors (href="#..." or bare id targets used to jump into a
+    # heading) are left alone since they wrap real content, not navigation.
+    for a in body.find_all("a", href=True):
+        if not a["href"].startswith("#"):
+            a.decompose()
     html = body.decode_contents().strip()
     text = body.get_text(separator="\n", strip=True)
     return html, text
