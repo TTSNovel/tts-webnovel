@@ -10,9 +10,12 @@ from __future__ import annotations
 import html as html_module
 import logging
 import re
+import warnings
 from dataclasses import dataclass
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 from ebooklib import epub, ITEM_DOCUMENT
 from ebooklib.epub import EpubReader
 
