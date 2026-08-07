@@ -7,12 +7,14 @@ for the extension without needing a real web novel site. Layout follows the
 common webnovel-reader pattern (sticky "back to TOC" bar, prev/TOC/next
 button row, centered reading column) instead of a bare list of links.
 
-Usage: python3 generate_site.py path/to/book.epub [output_dir]
+Usage: python3 tools/generate_site.py path/to/book.epub [output_dir]
 """
 import html
 import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 
 from epub_parser import extract_book
 

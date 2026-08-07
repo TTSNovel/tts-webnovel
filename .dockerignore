@@ -6,6 +6,5 @@ __pycache__/
 site_assets/
 output/
 *.epub
-test_epub_parser.py
-cli.py
-generate_site.py
+tests/
+tools/

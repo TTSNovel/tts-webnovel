@@ -1,10 +1,12 @@
 """Dump every chapter of a real .epub file to output_dir/NNN_slug.html for manual inspection.
 
-Usage: python3 cli.py path/to/book.epub [output_dir]
+Usage: python3 tools/cli.py path/to/book.epub [output_dir]
 """
 import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 
 from epub_parser import extract_chapters
 

@@ -5,10 +5,10 @@ TTS calls to tts-generate server-side so its shared secret never reaches
 the browser, and handles /import for adding new books at runtime.
 
 SITE_DIR is a GCS bucket mounted straight into the container (see
-environments/dev/main.tf) — not baked into the image — specifically so
-/import's writes here are immediately visible to every Cloud Run instance
-and survive redeploys. The bulk-load path (epub-parser/build_library.py)
-writes to the same bucket via `gcloud storage rsync`.
+tts-pipeline-infra/environments/dev/main.tf) — not baked into the image —
+specifically so /import's writes here are immediately visible to every
+Cloud Run instance and survive redeploys. The bulk-load path
+(build_library.py) writes to the same bucket via `gcloud storage rsync`.
 """
 import functools
 import hmac
@@ -27,7 +27,7 @@ from build_library import _LEGACY_EXTENSIONS, add_book_to_site, write_index
 
 _ALLOWED_IMPORT_EXTENSIONS = {".epub"} | _LEGACY_EXTENSIONS
 
-SITE_DIR = os.environ.get("SITE_DIR", os.path.join(os.path.dirname(__file__), "site"))
+SITE_DIR = os.environ.get("SITE_DIR", os.path.join(os.path.dirname(__file__), "..", "site"))
 WEB_AUTH_USER = os.environ["WEB_AUTH_USER"]
 WEB_AUTH_PASS = os.environ["WEB_AUTH_PASS"]
 TTS_API_URL = os.environ["TTS_API_URL"]

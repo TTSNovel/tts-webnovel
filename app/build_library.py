@@ -10,15 +10,15 @@ for why chapter pages are split this way):
   site/books/<slug>/data/NNNN.html      — chapter content fragment (no page chrome)
   site/assets/reader.js                 — shared read-aloud script (site_assets/reader.js)
 
-Nothing lives at books/<slug>/chapters/NNNN.html on disk — novel-web/
-server.py routes that URL pattern straight to chapter-shell.html instead,
-so pretty per-chapter URLs still work without one physical file each.
+Nothing lives at books/<slug>/chapters/NNNN.html on disk — server.py routes
+that URL pattern straight to chapter-shell.html instead, so pretty
+per-chapter URLs still work without one physical file each.
 
-books.json lets the live /import endpoint (novel-web/server.py) add a new
-book without having to re-scan every existing book's HTML to rebuild the
-home page — it's the same rendering path (book_renderer.py) used here.
+books.json lets the live /import endpoint (server.py) add a new book
+without having to re-scan every existing book's HTML to rebuild the home
+page — it's the same rendering path (book_renderer.py) used here.
 
-Usage: python3 build_library.py <epub_dir_or_file> [<epub_dir_or_file> ...] [-o site]
+Usage: python3 app/build_library.py <epub_dir_or_file> [<epub_dir_or_file> ...] [-o site]
 """
 import json
 import shutil
@@ -129,7 +129,7 @@ def build_library(inputs: list[str], output_dir: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
     assets_dir = out / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
-    site_assets = Path(__file__).parent / "site_assets"
+    site_assets = Path(__file__).resolve().parent.parent / "site_assets"
     shutil.copy(site_assets / "reader.js", assets_dir / "reader.js")
     shutil.copy(site_assets / "manifest.json", out / "manifest.json")
     shutil.copy(site_assets / "sw.js", out / "sw.js")
