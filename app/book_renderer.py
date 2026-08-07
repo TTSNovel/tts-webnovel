@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import html
 import json
-import re
 
 # Deterministic "cover" placeholder (no real cover art available) — a
 # gradient + the title's first 1-2 characters, same idea as Spotify/Notion
@@ -34,12 +33,6 @@ def cover_initial(title: str) -> str:
         if ch.isalnum():
             return ch.upper()
     return "?"
-
-
-def slugify(text: str) -> str:
-    slug = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE).strip().lower()
-    slug = re.sub(r"[\s_-]+", "-", slug)
-    return slug[:60] or "book"
 
 
 _CSS = """
@@ -71,18 +64,23 @@ a { color: inherit; text-decoration: none; }
 
 /* home page */
 .site-topbar {
-  position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 1rem;
-  padding: .9rem 1.25rem; background: var(--surface); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 10; display: flex; flex-direction: column; gap: .6rem;
+  padding: .7rem 1.1rem; background: var(--surface); border-bottom: 1px solid var(--border);
 }
-.site-topbar h1 { font-size: 1.15rem; margin: 0; white-space: nowrap; }
-.site-topbar .spacer { flex: 1; }
+.site-topbar-row { display: flex; align-items: center; gap: .6rem; }
+.site-topbar h1 {
+  font-size: 1.1rem; margin: 0; flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.site-actions { display: flex; gap: .5rem; flex: none; }
 .site-search {
-  flex: 1; max-width: 340px; padding: .5rem .8rem; border-radius: 999px;
+  width: 100%; padding: .55rem .9rem; border-radius: 999px;
   border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: .9rem;
 }
 .site-topbar .import-link {
-  padding: .5rem 1rem; border-radius: 999px; background: var(--accent); color: var(--accent-text);
-  font-size: .85rem; font-weight: 600; white-space: nowrap;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 2.3rem; height: 2.3rem; flex: none; border-radius: 999px;
+  background: var(--accent); color: var(--accent-text); font-size: 1.05rem;
 }
 .category { margin: 2rem 0; }
 .category h2 {
@@ -136,10 +134,16 @@ article p { margin: 0 0 1.1em; font-size: 1.05rem; }
 .btn.disabled { opacity: .4; pointer-events: none; }
 .btn-primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 
-/* reader control bar */
+/* reader control bar — fixed width on purpose: status/progress text length
+   changes constantly during playback (chapter transitions, TTS errors,
+   model-download percentages), and this bar is centered via left:50% +
+   translateX(-50%), so if its width were content-driven it visibly
+   shifts/jumps left-right on every text change. Fixed width + ellipsis
+   truncation inside keeps its position and size completely static. */
 .reader-bar {
   position: fixed; left: 50%; bottom: 1rem; transform: translateX(-50%);
-  display: flex; align-items: center; gap: .6rem; padding: .5rem .75rem;
+  display: flex; align-items: center; gap: .5rem; padding: .5rem .75rem;
+  width: min(92vw, 340px);
   background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
   box-shadow: 0 4px 16px rgba(0,0,0,.15); z-index: 20;
 }
@@ -148,8 +152,11 @@ article p { margin: 0 0 1.1em; font-size: 1.05rem; }
   background: var(--accent); color: var(--accent-text); font-size: 1rem; cursor: pointer;
 }
 .reader-btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); font-size: 1.1rem; }
-.reader-progress { font-size: .85rem; color: var(--muted); min-width: 4.5rem; text-align: center; }
-.reader-status { font-size: .8rem; color: var(--muted); max-width: 9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reader-progress { font-size: .85rem; color: var(--muted); width: 4.5rem; flex: none; text-align: center; }
+.reader-status {
+  font-size: .8rem; color: var(--muted); flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 .reader-settings {
   position: fixed; left: 50%; bottom: 4.5rem; transform: translateX(-50%);
@@ -165,6 +172,10 @@ article p { margin: 0 0 1.1em; font-size: 1.05rem; }
 }
 .reader-settings-checkbox { flex-direction: row !important; align-items: center; gap: .5rem !important; }
 .reader-settings-checkbox input { width: auto; }
+.reader-piper-offline { display: flex; align-items: center; gap: .5rem; font-size: .78rem; color: var(--muted); }
+.reader-piper-offline[hidden] { display: none; }
+.reader-piper-offline .dl-btn { padding: .3rem .7rem; font-size: .75rem; }
+.reader-piper-offline .dl-progress { flex: 1; }
 
 /* import page */
 .import-form { max-width: 480px; margin: 3rem auto; padding: 2rem; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; }
@@ -176,6 +187,48 @@ article p { margin: 0 0 1.1em; font-size: 1.05rem; }
 .import-form .msg { font-size: .85rem; margin-bottom: 1rem; padding: .6rem .8rem; border-radius: 8px; }
 .import-form .msg.ok { background: rgba(22,163,74,.15); color: #16a34a; }
 .import-form .msg.err { background: rgba(220,38,38,.15); color: #dc2626; }
+
+/* download page */
+.book-dl { margin-top: 1rem; }
+.book-dl .dl-progress { max-width: 220px; }
+.dl-hint { color: var(--muted); font-size: .9rem; }
+.dl-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: var(--surface); }
+.dl-row { display: flex; align-items: center; gap: 1rem; padding: .9rem 1.1rem; }
+.dl-row + .dl-row { border-top: 1px solid var(--border); }
+.dl-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: .15rem; }
+.dl-title { font-weight: 600; font-size: .95rem; }
+a.dl-title:hover { color: var(--accent); }
+.dl-author, .dl-meta { color: var(--muted); font-size: .78rem; }
+.dl-progress { height: 4px; border-radius: 999px; background: var(--hover); margin-top: .4rem; overflow: hidden; }
+.dl-progress[hidden] { display: none; }
+.dl-progress-bar { height: 100%; width: 0; background: var(--accent); transition: width .2s ease; }
+.dl-btn {
+  flex: none; padding: .5rem 1rem; border-radius: 999px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text); font-size: .82rem; font-weight: 600; cursor: pointer;
+}
+.dl-btn:disabled { opacity: .6; cursor: default; }
+.dl-btn:not(:disabled):not(.dl-btn-danger):hover { border-color: var(--accent); color: var(--accent); }
+.dl-btn-danger { border-color: transparent; background: transparent; color: #dc2626; }
+.dl-btn-danger:hover { background: rgba(220,38,38,.12); }
+
+/* Piper-offline model management, on the Download page — a big, easy-to-
+   hit target on its own page, not squeezed into the reader's small
+   settings popup where a "click outside closes it" listener (now
+   removed, but this stays as the reliable way regardless) used to make
+   it hard to actually hit. */
+.piper-offline-section { margin-top: 2.5rem; }
+.piper-offline-heading { font-size: 1.05rem; margin: 0 0 .8rem; }
+.piper-offline-card {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; padding: 1.1rem 1.25rem;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+}
+.piper-offline-status { flex: 1; min-width: 160px; color: var(--muted); font-size: .9rem; }
+.dl-btn-large {
+  flex: none; padding: .9rem 1.6rem; border-radius: 999px; border: none;
+  background: #dc2626; color: #fff; font-size: 1rem; font-weight: 700; cursor: pointer;
+}
+.dl-btn-large:hover { background: #b91c1c; }
+.dl-btn-large:disabled { opacity: .6; cursor: default; }
 """
 
 # iOS Safari's "Add to Home Screen" reads the apple-* meta/link tags
@@ -184,6 +237,7 @@ article p { margin: 0 0 1.1em; font-size: 1.05rem; }
 # works unchanged regardless of how deeply nested the page is (chapter
 # pages sit 3 levels under site root).
 _PWA_HEAD = """<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/assets/icons/icon-192.png" type="image/png">
 <meta name="theme-color" content="#4f46e5">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Thư viện truyện">
@@ -191,13 +245,13 @@ _PWA_HEAD = """<link rel="manifest" href="/manifest.json">
 <link rel="apple-touch-icon" href="/assets/icons/icon-180.png">
 <script>if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');</script>"""
 
-# App-shell pattern: this ONE file is served for every "/books/<slug>/
+# App-shell pattern: this ONE file is served for every "/books/<id>/
 # chapters/<n>.html" URL (see novel-web/server.py's chapter_shell route) —
 # byte-identical regardless of which book/chapter, so changing the reader
 # UI means rewriting this single file instead of one per chapter (was
 # ~72,000 separate full pages, each with its own copy of this same CSS).
 # reader.js parses the visited URL itself, fetches the matching fragment
-# from books/<slug>/data/<n>.html, and fills in the topbar/nav — nothing
+# from books/<id>/data/<n>.html, and fills in the topbar/nav — nothing
 # here is chapter-specific.
 _CHAPTER_SHELL = """<!doctype html>
 <html lang="vi">
@@ -221,6 +275,8 @@ _CHAPTER_SHELL = """<!doctype html>
     <a class="btn btn-primary disabled" data-chapter-nav="next" rel="next" href="#">Chương tiếp theo ›</a>
   </nav>
 </div>
+<script src="../../../assets/download.js"></script>
+<script src="../../../assets/piper-offline.js"></script>
 <script src="../../../assets/reader.js"></script>
 </body>
 </html>
@@ -248,12 +304,17 @@ _BOOK_PAGE = """<!doctype html>
       {author_html}
       <p class="count">{n} chương</p>
       <span class="category-badge">{category}</span>
+      <div class="book-dl">
+        <button class="dl-btn" id="book-dl-btn" data-book-id="{book_id}">Tải xuống để đọc offline</button>
+        <div class="dl-progress" id="book-dl-progress" hidden><div class="dl-progress-bar"></div></div>
+      </div>
     </div>
   </header>
   <ol class="chapter-list">
 {items}
   </ol>
 </div>
+<script src="/assets/download.js"></script>
 </body>
 </html>
 """
@@ -269,7 +330,13 @@ _INDEX_PAGE = """<!doctype html>
 </head>
 <body>
 <div class="site-topbar">
-  <h1>📚 Thư viện truyện</h1>
+  <div class="site-topbar-row">
+    <h1>📚 Thư viện truyện</h1>
+    <div class="site-actions">
+      <a class="import-link" href="/download.html" title="Đã tải xuống">📥</a>
+      <a class="import-link" href="/import" title="Thêm truyện">➕</a>
+    </div>
+  </div>
   <input class="site-search" type="search" placeholder="Tìm truyện…" oninput="
     document.querySelectorAll('.book-card').forEach(function(el){{
       el.hidden = !el.dataset.title.includes(this.value.toLowerCase());
@@ -278,17 +345,16 @@ _INDEX_PAGE = """<!doctype html>
       cat.hidden = !cat.querySelector('.book-card:not([hidden])');
     }});
   ">
-  <span class="spacer"></span>
-  <a class="import-link" href="/import">+ Thêm truyện</a>
 </div>
-<div class="wrap">
+<div class="wrap" id="home-wrap">
 {categories}
 </div>
+<script src="/assets/download.js"></script>
 </body>
 </html>
 """
 
-_BOOK_CARD = """    <a class="book-card" href="books/{slug}/index.html" data-title="{title_lower}">
+_BOOK_CARD = """    <a class="book-card" href="books/{id}/index.html" data-title="{title_lower}">
       <div class="cover" style="background:{cover_gradient}">{cover_initial}</div>
       <span class="title">{title}</span>
       {author_html}
@@ -315,7 +381,7 @@ def render_book_meta(title: str, author: str | None, category: str, n: int) -> s
     return json.dumps({"title": title, "author": author, "category": category, "n": n}, ensure_ascii=False)
 
 
-def render_book_page(book_title: str, author: str | None, category: str, chapters) -> str:
+def render_book_page(book_id: int, book_title: str, author: str | None, category: str, chapters) -> str:
     filenames = [f"{ch.index:04d}.html" for ch in chapters]
     items = "\n".join(
         f'    <li><a href="chapters/{fname}"><span class="num">{ch.index + 1}</span>'
@@ -326,6 +392,7 @@ def render_book_page(book_title: str, author: str | None, category: str, chapter
     return _BOOK_PAGE.format(
         css=_CSS,
         pwa_head=_PWA_HEAD,
+        book_id=book_id,
         book_title=html.escape(book_title),
         cover_gradient=cover_gradient(book_title),
         cover_initial=html.escape(cover_initial(book_title)),
@@ -344,7 +411,7 @@ def render_index_page(books_by_category: dict[str, list[dict]]) -> str:
         for b in books:
             author_html = f'<span class="author">{html.escape(b["author"])}</span>' if b.get("author") else ""
             cards.append(_BOOK_CARD.format(
-                slug=b["slug"],
+                id=b["id"],
                 title=html.escape(b["title"]),
                 title_lower=html.escape(b["title"].lower()),
                 cover_gradient=cover_gradient(b["title"]),

@@ -9,10 +9,10 @@
  * and the extension's auto-next-chapter / auto-stop-timer settings.
  *
  * App-shell pattern: this same script + its page (chapter-shell.html) is
- * served for every "/books/<slug>/chapters/<n>.html" URL (see server.py's
+ * served for every "/books/<id>/chapters/<n>.html" URL (see server.py's
  * chapter_shell route) — nothing here is chapter-specific up front. On
  * load, this file parses the visited URL itself, fetches the matching
- * content fragment from books/<slug>/data/<n>.html and the book's
+ * content fragment from books/<id>/data/<n>.html and the book's
  * meta.json (title/author/chapter count), and fills in the page. Chapter
  * navigation (auto-next AND manual prev/next) reuses the exact same fetch,
  * swapping <article> in place — never a real page navigation, both because
@@ -55,10 +55,15 @@
 
   // Chapter-page identity, resolved once on load from the URL + meta.json
   // (see initChapterPage) and kept current by goToChapter() on every jump.
-  let bookSlug = null;
+  let bookId = null;
   let bookTitle = '';
   let totalChapters = 0;
   let currentChapterNum = 0;
+
+  // Set while the "Piper (offline)" model is auto-downloading (see
+  // refreshPiperOfflineBox) so fetchAudioUrl can wait for it instead of
+  // failing outright if playback starts before the download finishes.
+  let piperOfflineDownloadPromise = null;
 
   function pad4(n) {
     return String(n).padStart(4, '0');
@@ -153,7 +158,7 @@
 
     const entry = { num: nextNum, html: null, audioPromise: null };
     nextChapterPrefetch = entry;
-    fetch(`/books/${bookSlug}/data/${pad4(nextNum)}.html`)
+    fetch(`/books/${bookId}/data/${pad4(nextNum)}.html`)
       .then((r) => {
         if (!r.ok) throw new Error(`fetch chapter failed: ${r.status}`);
         return r.text();
@@ -177,6 +182,13 @@
   async function fetchAudioUrl(text) {
     const speed = parseFloat(localStorage.getItem('reader.speed') || '1.0');
     const model = localStorage.getItem('reader.model') || '';
+
+    if (model === 'piper_offline') {
+      await ensurePiperOfflineReady();
+      const blob = await window.PiperOffline.synthesize(cleanTextForTTS(text), speed);
+      return URL.createObjectURL(blob);
+    }
+
     const response = await fetch('/api/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -297,7 +309,7 @@
   async function goToChapter(num, prefetchedHtml) {
     let html = prefetchedHtml;
     if (html == null) {
-      const resp = await fetch(`/books/${bookSlug}/data/${pad4(num)}.html`);
+      const resp = await fetch(`/books/${bookId}/data/${pad4(num)}.html`);
       if (!resp.ok) throw new Error(`fetch chapter failed: ${resp.status}`);
       html = await resp.text();
     }
@@ -307,23 +319,23 @@
     updateChapterNav();
     const h1 = document.querySelector('article h1');
     document.title = `${h1 ? h1.textContent.trim() : ''} — ${bookTitle}`;
-    history.replaceState(null, '', `/books/${bookSlug}/chapters/${pad4(num)}.html`);
+    history.replaceState(null, '', `/books/${bookId}/chapters/${pad4(num)}.html`);
     window.scrollTo(0, 0);
   }
 
-  // Resolves bookSlug/bookTitle/totalChapters/currentChapterNum from the
+  // Resolves bookId/bookTitle/totalChapters/currentChapterNum from the
   // visited URL + the book's meta.json, then loads that chapter's content
   // — this is what turns the generic shell into "this specific chapter"
   // on first load. Returns false if the URL doesn't look like a chapter
   // page at all (shouldn't happen since this script only ships on those
   // pages, but fail safe rather than throw).
   async function initChapterPage() {
-    const m = window.location.pathname.match(/\/books\/([^/]+)\/chapters\/(\d+)\.html$/);
+    const m = window.location.pathname.match(/\/books\/(\d+)\/chapters\/(\d+)\.html$/);
     if (!m) return false;
-    bookSlug = m[1];
+    bookId = m[1];
     const num = parseInt(m[2], 10);
 
-    const metaResp = await fetch(`/books/${bookSlug}/meta.json`);
+    const metaResp = await fetch(`/books/${bookId}/meta.json`);
     if (!metaResp.ok) throw new Error(`fetch book meta failed: ${metaResp.status}`);
     const meta = await metaResp.json();
     bookTitle = meta.title;
@@ -349,8 +361,25 @@
         try {
           url = await preloadCache[i];
         } catch (e) {
-          index++;
-          continue;
+          console.error(
+            'reader.js: TTS fetch failed for sentence',
+            i,
+            '::',
+            (e && e.name) || typeof e,
+            (e && e.message) || String(e),
+            '::stack::',
+            (e && e.stack) || 'n/a'
+          );
+          // Stop outright instead of skipping ahead — this used to be
+          // `index++; continue`, which on a persistent failure (the whole
+          // point of PRELOAD_AHEAD preloading several sentences at once)
+          // blew through the rest of the chapter in seconds with nothing
+          // ever actually played. index is left where it is so pressing
+          // ▶ again retries this exact sentence instead of skipping it.
+          if (els) els.status.textContent = `Lỗi đọc câu ${i + 1}: ${(e && e.message) || e}`;
+          clearAutoStopState();
+          stop();
+          return;
         }
         if (!active) break;
 
@@ -523,6 +552,82 @@
     navigator.mediaSession.setActionHandler('previoustrack', () => jumpToChapterNum(currentChapterNum - 1));
   }
 
+  // Shows/hides the model box in the settings panel depending on whether
+  // "Piper (offline)" is the selected voice, and just reflects state —
+  // selecting the voice does NOT itself download anything. The actual
+  // download only starts from ensurePiperOfflineReady(), called when ▶ is
+  // pressed and audio is actually about to be synthesized; the button
+  // here only ever offers "Xoá" once a model is present.
+  async function refreshPiperOfflineBox() {
+    if (!els) return;
+    const isOffline = els.model.value === 'piper_offline';
+    els.piperOfflineBox.hidden = !isOffline;
+    if (!isOffline || !window.PiperOffline) return;
+
+    els.piperOfflineProgress.hidden = true;
+    const downloaded = await window.PiperOffline.isDownloaded();
+    if (downloaded) {
+      els.piperOfflineStatus.textContent = 'Đã tải — dùng được offline';
+      els.piperOfflineBtn.hidden = false;
+      els.piperOfflineBtn.disabled = false;
+      els.piperOfflineBtn.textContent = 'Xoá model';
+    } else {
+      els.piperOfflineStatus.textContent = 'Chưa tải — sẽ tự tải khi bấm ▶ (~93MB)';
+      els.piperOfflineBtn.hidden = true;
+    }
+  }
+
+  // Kicks off the model download the first time it's actually needed
+  // (first ▶ press with this voice selected) and lets every subsequent
+  // fetchAudioUrl() call piggyback on the same in-flight download instead
+  // of starting a second one.
+  // Progress only ever shows inside the settings panel's piperOfflineBox —
+  // deliberately never mirrored into the bottom bar's small status text.
+  // That text used to get a frequently-changing "Đang tải model… NN%"
+  // string during download, and since the bar's width used to be
+  // content-driven (see .reader-bar CSS), that made the whole centered
+  // bar visibly shift left-right on every percentage update.
+  function ensurePiperOfflineReady() {
+    if (!window.PiperOffline) return Promise.reject(new Error('Piper offline chưa sẵn sàng'));
+    if (!piperOfflineDownloadPromise) {
+      piperOfflineDownloadPromise = window.PiperOffline.isDownloaded().then((downloaded) => {
+        if (downloaded) return;
+        if (els) {
+          els.piperOfflineBtn.hidden = true;
+          els.piperOfflineProgress.hidden = false;
+          els.piperOfflineStatus.textContent = 'Đang tải model (~93MB)… 0%';
+        }
+        return window.PiperOffline.download((loaded, total) => {
+          const pct = total ? Math.round((loaded / total) * 100) : 0;
+          if (els) {
+            els.piperOfflineStatus.textContent = `Đang tải model… ${pct}%`;
+            els.piperOfflineProgress.querySelector('.dl-progress-bar').style.width = `${pct}%`;
+          }
+        });
+      });
+      piperOfflineDownloadPromise
+        .then(() => {
+          // Deliberately NOT reset to null here — once resolved, every
+          // future ensurePiperOfflineReady() call (one per sentence, for
+          // the rest of the reading session) just reuses this same
+          // already-resolved promise for free. Resetting it used to force
+          // a fresh isDownloaded() re-check per sentence, and something
+          // about that path caused the 63MB model to be re-fetched over
+          // and over (seen live as dozens of repeated/canceled requests).
+          refreshPiperOfflineBox();
+        })
+        .catch((err) => {
+          piperOfflineDownloadPromise = null; // let the next ▶ press retry
+          if (els) {
+            els.piperOfflineStatus.textContent = 'Tải lỗi — bấm ▶ để thử lại';
+            els.piperOfflineProgress.hidden = true;
+          }
+          throw err;
+        });
+    }
+    return piperOfflineDownloadPromise;
+  }
+
   function buildControlBar() {
     const bar = document.createElement('div');
     bar.className = 'reader-bar';
@@ -542,8 +647,14 @@
           <option value="piper_vi">Piper VN</option>
           <option value="google_tts">Google Cloud TTS</option>
           <option value="vieneu">VieNeu-TTS</option>
+          <option value="piper_offline">Piper (offline)</option>
         </select>
       </label>
+      <div class="reader-piper-offline" data-role="piperOfflineBox" hidden>
+        <span data-role="piperOfflineStatus"></span>
+        <button type="button" class="dl-btn" data-role="piperOfflineBtn"></button>
+        <div class="dl-progress" data-role="piperOfflineProgress" hidden><div class="dl-progress-bar"></div></div>
+      </div>
       <label>Tốc độ
         <select data-role="speed">
           <option value="0.85">0.85x</option>
@@ -575,6 +686,10 @@
       speed: panel.querySelector('[data-role="speed"]'),
       autoNext: panel.querySelector('[data-role="autoNext"]'),
       autoStopMinutes: panel.querySelector('[data-role="autoStopMinutes"]'),
+      piperOfflineBox: panel.querySelector('[data-role="piperOfflineBox"]'),
+      piperOfflineStatus: panel.querySelector('[data-role="piperOfflineStatus"]'),
+      piperOfflineBtn: panel.querySelector('[data-role="piperOfflineBtn"]'),
+      piperOfflineProgress: panel.querySelector('[data-role="piperOfflineProgress"]'),
     };
 
     els.model.value = localStorage.getItem('reader.model') || 'piper_vi';
@@ -584,7 +699,9 @@
       // drop it so the next sentence picks up the newly selected voice
       // instead of finishing the current chapter in a mixed voice.
       dropPreloadedAudio();
+      refreshPiperOfflineBox();
     });
+    refreshPiperOfflineBox();
 
     els.speed.value = localStorage.getItem('reader.speed') || '1';
     els.speed.addEventListener('change', () => {
@@ -604,18 +721,44 @@
       if (active) scheduleAutoStop(); // apply the new value to the running session
     });
 
+    // Only the ⚙ icon toggles the panel — no "click outside closes it"
+    // listener. That listener used to intercept taps on piperOfflineBtn
+    // (right under the voice <select>, inside this same panel) before
+    // its own click handler ran, since document-level click handlers see
+    // the event as it bubbles up past the panel.
     els.settingsToggle.addEventListener('click', () => {
       panel.hidden = !panel.hidden;
-    });
-    document.addEventListener('click', (e) => {
-      if (panel.hidden) return;
-      if (!panel.contains(e.target) && e.target !== els.settingsToggle) panel.hidden = true;
     });
 
     els.playBtn.addEventListener('click', () => {
       if (!active) start();
       else if (!paused) pause();
       else resume();
+    });
+
+    // Only ever offers "Xoá model" — downloading happens automatically as
+    // soon as this voice is selected (see refreshPiperOfflineBox).
+    els.piperOfflineBtn.addEventListener('click', async (e) => {
+      // Stopped from bubbling to the document-level "click outside closes
+      // the panel" listener (see below) — on iOS Safari, taps on this
+      // button (right under the voice <select>, in a position:fixed
+      // panel) were closing the whole panel and never reaching this
+      // handler at all, consistent with that listener winning the race.
+      e.stopPropagation();
+      console.warn('reader.js: piperOfflineBtn clicked, PiperOffline defined?', !!window.PiperOffline);
+      if (!window.PiperOffline) return;
+      els.piperOfflineBtn.disabled = true;
+      try {
+        await window.PiperOffline.removeModel();
+        console.warn('reader.js: removeModel() resolved without throwing');
+      } catch (e) {
+        console.error('reader.js: xoá model Piper offline thất bại ::', (e && e.name) || typeof e, (e && e.message) || e);
+        els.piperOfflineStatus.textContent = `Xoá lỗi: ${(e && e.message) || e}`;
+        els.piperOfflineBtn.disabled = false;
+        return;
+      }
+      refreshPiperOfflineBox();
+      console.warn('reader.js: after refreshPiperOfflineBox, isDownloaded now:', await window.PiperOffline.isDownloaded());
     });
 
     document.addEventListener('keydown', (e) => {

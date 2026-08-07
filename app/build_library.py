@@ -3,14 +3,18 @@
 Layout (app-shell pattern — see book_renderer.py's _CHAPTER_SHELL docstring
 for why chapter pages are split this way):
   site/index.html                       — home, books grouped by category
-  site/books.json                       — manifest: [{slug, title, author, category, n}]
+  site/books.json                       — manifest: [{id, title, author, category, n}]
   site/chapter-shell.html               — the ONE page served for every chapter URL
-  site/books/<slug>/index.html          — one book: chapter list
-  site/books/<slug>/meta.json           — {title, author, category, n} for reader.js
-  site/books/<slug>/data/NNNN.html      — chapter content fragment (no page chrome)
+  site/books/<id>/index.html            — one book: chapter list
+  site/books/<id>/meta.json             — {title, author, category, n} for reader.js
+  site/books/<id>/data/NNNN.html        — chapter content fragment (no page chrome)
   site/assets/reader.js                 — shared read-aloud script (site_assets/reader.js)
 
-Nothing lives at books/<slug>/chapters/NNNN.html on disk — server.py routes
+Each book's <id> is a sequential integer, assigned in the order books are
+added (bulk build or live /import) — never derived from the title, so a
+book's URL never changes if it gets re-titled later.
+
+Nothing lives at books/<id>/chapters/NNNN.html on disk — server.py routes
 that URL pattern straight to chapter-shell.html instead, so pretty
 per-chapter URLs still work without one physical file each.
 
@@ -31,7 +35,6 @@ from book_renderer import (
     render_chapter_fragment,
     render_chapter_shell,
     render_index_page,
-    slugify,
 )
 from classify import classify
 from epub_parser import extract_book, extract_book_from_mobi
@@ -72,10 +75,10 @@ def _iter_book_paths(inputs: list[str]) -> list[Path]:
     return paths
 
 
-def add_book_to_site(site_dir: Path, epub_path: Path, used_slugs: set[str]) -> dict:
-    """Extract + render a single book into site_dir/books/<slug>/, returning
+def add_book_to_site(site_dir: Path, epub_path: Path, used_ids: set[int]) -> dict:
+    """Extract + render a single book into site_dir/books/<id>/, returning
     its books.json entry. Shared by the bulk CLI builder and the live
-    /import endpoint — the only difference is the caller's used_slugs set
+    /import endpoint — the only difference is the caller's used_ids set
     (bulk building starts empty; live import loads it from books.json)."""
     if epub_path.suffix.lower() in _LEGACY_EXTENSIONS:
         metadata, chapters = extract_book_from_mobi(str(epub_path))
@@ -88,15 +91,10 @@ def add_book_to_site(site_dir: Path, epub_path: Path, used_slugs: set[str]) -> d
     author = metadata["author"]
     category = classify(book_title, metadata.get("description", ""))
 
-    slug = slugify(book_title)
-    base_slug = slug
-    n = 2
-    while slug in used_slugs:
-        slug = f"{base_slug}-{n}"
-        n += 1
-    used_slugs.add(slug)
+    book_id = max(used_ids, default=0) + 1
+    used_ids.add(book_id)
 
-    book_dir = site_dir / "books" / slug
+    book_dir = site_dir / "books" / str(book_id)
     data_dir = book_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -105,7 +103,7 @@ def add_book_to_site(site_dir: Path, epub_path: Path, used_slugs: set[str]) -> d
         (data_dir / f"{ch.index:04d}.html").write_text(fragment, encoding="utf-8")
 
     (book_dir / "index.html").write_text(
-        render_book_page(book_title=book_title, author=author, category=category, chapters=chapters),
+        render_book_page(book_id=book_id, book_title=book_title, author=author, category=category, chapters=chapters),
         encoding="utf-8",
     )
     (book_dir / "meta.json").write_text(
@@ -113,7 +111,7 @@ def add_book_to_site(site_dir: Path, epub_path: Path, used_slugs: set[str]) -> d
         encoding="utf-8",
     )
 
-    return {"slug": slug, "title": book_title, "author": author, "category": category, "n": len(chapters)}
+    return {"id": book_id, "title": book_title, "author": author, "category": category, "n": len(chapters)}
 
 
 def write_index(site_dir: Path, manifest: list[dict]) -> None:
@@ -131,25 +129,28 @@ def build_library(inputs: list[str], output_dir: str) -> None:
     assets_dir.mkdir(parents=True, exist_ok=True)
     site_assets = Path(__file__).resolve().parent.parent / "site_assets"
     shutil.copy(site_assets / "reader.js", assets_dir / "reader.js")
+    shutil.copy(site_assets / "download.js", assets_dir / "download.js")
+    shutil.copy(site_assets / "piper-offline.js", assets_dir / "piper-offline.js")
     shutil.copy(site_assets / "manifest.json", out / "manifest.json")
     shutil.copy(site_assets / "sw.js", out / "sw.js")
     shutil.copytree(site_assets / "icons", assets_dir / "icons", dirs_exist_ok=True)
+    shutil.copytree(site_assets / "vendor", assets_dir / "vendor", dirs_exist_ok=True)
     (out / "chapter-shell.html").write_text(render_chapter_shell(), encoding="utf-8")
 
     book_paths = _iter_book_paths(inputs)
     print(f"Found {len(book_paths)} book files")
 
     manifest: list[dict] = []
-    used_slugs: set[str] = set()
+    used_ids: set[int] = set()
 
     for path in book_paths:
         try:
-            entry = add_book_to_site(out, path, used_slugs)
+            entry = add_book_to_site(out, path, used_ids)
         except Exception as e:
             print(f"  SKIP {path.name}: {e}")
             continue
         manifest.append(entry)
-        print(f"  OK   {entry['title']} [{entry['category']}] — {entry['n']} chương -> books/{entry['slug']}/")
+        print(f"  OK   {entry['title']} [{entry['category']}] — {entry['n']} chương -> books/{entry['id']}/")
 
     write_index(out, manifest)
     categories = {e["category"] for e in manifest}

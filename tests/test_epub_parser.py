@@ -53,6 +53,43 @@ def test_extract_chapters_order_titles_and_text():
         assert "Nội dung chương hai." in chapters[1].text
 
 
+def test_strips_duplicate_title_and_credit_line_from_body():
+    """Real-world .txt-converted web novels often repeat the chapter title
+    as the first line of the body, followed by a typesetting-group credit
+    line (e.g. a Zalo contact) — both are redundant boilerplate since
+    render_chapter_fragment already renders the title as its own <h1>."""
+    with tempfile.TemporaryDirectory() as tmp:
+        epub_path = str(Path(tmp) / "boilerplate.epub")
+        book = epub.EpubBook()
+        book.set_identifier("boilerplate-id")
+        book.set_title("Boilerplate Novel")
+        book.set_language("vi")
+
+        c1 = epub.EpubHtml(title="Chương 1: Hạ Chí đã tới (1)", file_name="chap_01.xhtml", lang="vi")
+        c1.content = (
+            "<html><body>"
+            "<h1>Chương 1: Hạ Chí đã tới (1)</h1>"
+            "<p>Zalo người làm sách: 0945 787 018</p>"
+            "<p>Tháng tám, trong vùng núi sâu ở tây nam bộ Trung Quốc.</p>"
+            "</body></html>"
+        )
+        book.add_item(c1)
+        book.toc = (epub.Link("chap_01.xhtml", "Chương 1: Hạ Chí đã tới (1)", "c1"),)
+        book.add_item(epub.EpubNcx())
+        book.add_item(epub.EpubNav())
+        book.spine = ["nav", c1]
+
+        epub.write_epub(epub_path, book)
+
+        chapters = extract_chapters(epub_path)
+        assert len(chapters) == 1
+        ch = chapters[0]
+        assert ch.title == "Chương 1: Hạ Chí đã tới (1)"
+        assert "Hạ Chí đã tới" not in ch.html
+        assert "Zalo" not in ch.html
+        assert "Tháng tám" in ch.html
+
+
 def test_fallback_title_when_toc_missing():
     with tempfile.TemporaryDirectory() as tmp:
         epub_path = str(Path(tmp) / "no_toc.epub")

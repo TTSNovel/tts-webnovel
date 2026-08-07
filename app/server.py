@@ -47,6 +47,7 @@ app.permanent_session_lifetime = timedelta(days=30)
 app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024
 
 _PWA_HEAD = """<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/assets/icons/icon-192.png" type="image/png">
 <meta name="theme-color" content="#4f46e5">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Thư viện truyện">
@@ -192,7 +193,7 @@ def import_submit():
     site_dir = Path(SITE_DIR)
     manifest_path = site_dir / "books.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else []
-    used_slugs = {b["slug"] for b in manifest}
+    used_ids = {b["id"] for b in manifest}
 
     # Extract into a local tmp path first (not the GCS mount) — the
     # extraction libraries do plenty of small intermediate file I/O
@@ -202,7 +203,7 @@ def import_submit():
         tmp_path = Path(tmp) / f.filename
         f.save(tmp_path)
         try:
-            entry = add_book_to_site(site_dir, tmp_path, used_slugs)
+            entry = add_book_to_site(site_dir, tmp_path, used_ids)
         except Exception as e:
             return _IMPORT_PAGE.format(
                 pwa_head=_PWA_HEAD, css=_CSS, msg_html=f'<div class="msg err">Lỗi: {html.escape(str(e))}</div>'
@@ -214,9 +215,46 @@ def import_submit():
     msg = (
         f'<div class="msg ok">Đã thêm "{html.escape(entry["title"])}" '
         f'({entry["n"]} chương, thể loại {html.escape(entry["category"])}) — '
-        f'<a href="/books/{entry["slug"]}/index.html">Xem ngay</a></div>'
+        f'<a href="/books/{entry["id"]}/index.html">Xem ngay</a></div>'
     )
     return _IMPORT_PAGE.format(pwa_head=_PWA_HEAD, css=_CSS, msg_html=msg)
+
+
+_DOWNLOAD_PAGE = """<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>Tải xuống — Thư viện truyện</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{pwa_head}
+<style>{css}</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="back" href="/">‹ Trang chủ</a>
+  <span class="book-title">Đã tải xuống</span>
+</div>
+<div class="wrap" id="download-app">
+  <p class="dl-hint">Đang tải danh sách…</p>
+</div>
+<div class="wrap piper-offline-section">
+  <h2 class="piper-offline-heading">🔊 Giọng đọc offline (Piper)</h2>
+  <div class="piper-offline-card">
+    <span id="piper-offline-status" class="piper-offline-status">Đang kiểm tra…</span>
+    <button type="button" id="piper-offline-delete" class="dl-btn-large" hidden>Xoá model Piper offline</button>
+  </div>
+</div>
+<script src="/assets/piper-offline.js"></script>
+<script src="/assets/download.js"></script>
+</body>
+</html>
+"""
+
+
+@app.route("/download.html")
+@require_auth
+def download_page():
+    return _DOWNLOAD_PAGE.format(pwa_head=_PWA_HEAD, css=_CSS)
 
 
 @app.route("/api/tts", methods=["POST"])
@@ -250,15 +288,15 @@ def index():
 
 # App-shell pattern: every chapter URL serves this one static page instead
 # of a physical per-chapter file — reader.js reads the URL itself client-
-# side and fetches the matching data fragment from books/<slug>/data/
+# side and fetches the matching data fragment from books/<id>/data/
 # <chapter>.html. Keeps changing the reader UI a single-file edit instead
 # of rewriting one of ~72,000 near-identical pages. Werkzeug prefers this
 # route over the generic catch-all below for matching URLs regardless of
 # definition order (literal segments rank higher than a <path:...> catch-
 # all), but it's placed first for readability anyway.
-@app.route("/books/<slug>/chapters/<chapter>.html")
+@app.route("/books/<int:book_id>/chapters/<chapter>.html")
 @require_auth
-def chapter_shell(slug, chapter):
+def chapter_shell(book_id, chapter):
     return send_from_directory(SITE_DIR, "chapter-shell.html")
 
 
