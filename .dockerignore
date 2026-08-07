@@ -1,0 +1,11 @@
+venv/
+.git/
+__pycache__/
+.pytest_cache/
+*.pyc
+site_assets/
+output/
+*.epub
+test_epub_parser.py
+cli.py
+generate_site.py

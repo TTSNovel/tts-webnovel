@@ -10,8 +10,10 @@ from __future__ import annotations
 import html as html_module
 import logging
 import re
+import shutil
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
@@ -71,15 +73,27 @@ def _clean_html_and_text(raw_bytes: bytes) -> tuple[str, str]:
     # Strip elements that carry no readable content.
     for tag in body.find_all(["script", "style"]):
         tag.decompose()
-    # Cross-document links (table-of-contents entries, "prev/next chapter"
-    # nav) are never real chapter prose — a novel doesn't hyperlink its own
-    # sentences. Left in, their link text ("Chương 9: ...", "Chương sau")
-    # bleeds into the extracted text and, worse, gets mistaken for real
-    # chapter-marker boundaries by _split_by_chapter_markers on TOC pages.
-    # Same-page anchors (href="#..." or bare id targets used to jump into a
-    # heading) are left alone since they wrap real content, not navigation.
-    for a in body.find_all("a", href=True):
-        if not a["href"].startswith("#"):
+    for a in body.find_all("a"):
+        href = a.get("href")
+        if not href:
+            # No href at all — not a functional link, just inline markup
+            # noise (seen in raw unpacked mobi/prc: real chapter headings
+            # come wrapped in a bare `<a><span>Chương N: ...</span></a>`
+            # with no href). Leave its text alone; it's real content.
+            continue
+        if not href.startswith("#"):
+            # Cross-document link (another chapter file, "prev/next
+            # chapter" nav) — never real chapter prose, a novel doesn't
+            # hyperlink its own sentences. Left in, this bleeds into the
+            # extracted text and gets mistaken for a real chapter-marker
+            # boundary by _split_by_chapter_markers.
+            a.decompose()
+        elif _CHAPTER_MARKER_RE.match(a.get_text()):
+            # Single-mega-document sources (raw unpacked mobi/prc, no epub
+            # multi-file split) put their table of contents in the SAME
+            # document instead, linking to a same-page byte offset like
+            # href="#filepos301977" — same TOC-pollution problem as above,
+            # just a same-page href instead of cross-document.
             a.decompose()
     html = body.decode_contents().strip()
     text = body.get_text(separator="\n", strip=True)
@@ -101,7 +115,9 @@ def _fallback_title(soup_html: str, index: int) -> str:
 # tend to appear twice in a row right at the chapter boundary (title
 # rendered, then repeated immediately before the body) — a `min_gap` filters
 # out that immediate duplicate so it isn't treated as its own empty chapter.
-_CHAPTER_MARKER_RE = re.compile(r"^[ \t]*((?:Chương|Chapter)\s*\d+[^\n]{0,80})", re.IGNORECASE | re.MULTILINE)
+_CHAPTER_MARKER_RE = re.compile(
+    r"^[ \t]*(?:Q\d+\s*-\s*)?((?:Chương|Chapter)\s*\d+[^\n]{0,80})", re.IGNORECASE | re.MULTILINE
+)
 
 
 def _split_by_chapter_markers(text: str, min_gap: int = 200) -> list[tuple[str, str]] | None:
@@ -200,8 +216,51 @@ def extract_book(epub_path: str) -> tuple[dict, list[Chapter]]:
     book = epub.read_epub(epub_path)
     dc_title = book.get_metadata("DC", "title")
     dc_creator = book.get_metadata("DC", "creator")
+    dc_description = book.get_metadata("DC", "description")
+    description = dc_description[0][0] if dc_description else ""
     metadata = {
         "title": dc_title[0][0] if dc_title else None,
         "author": dc_creator[0][0] if dc_creator else None,
+        "description": BeautifulSoup(description, "lxml").get_text(" ", strip=True) if description else "",
     }
     return metadata, _extract_chapters_from_book(book)
+
+
+def extract_book_from_mobi(path: str) -> tuple[dict, list[Chapter]]:
+    """Extract a legacy .prc/.mobi/.azw3 file's chapters.
+
+    calibre's ebook-convert was pathologically slow on some of these (tens
+    of minutes, never finished on a 4.6MB file) — traced to the source
+    having ~44,000 fragmented <p> tags from an old Word-HTML export, which
+    its chapter/structure-detection heuristics choke on. The `mobi` package
+    just unpacks the raw PalmDOC/MOBI records with no structure analysis
+    (1-3 seconds for the same file), so this reuses epub_parser's own
+    (already-fast, already-tested) HTML-cleaning + marker-based chapter
+    splitting on the result instead of going through calibre at all.
+    """
+    import mobi
+
+    book_dir, extracted_path = mobi.extract(path)
+    try:
+        if extracted_path.endswith(".epub"):
+            # AZW3/KF8 unpacks straight to a real epub — reuse the normal path.
+            return extract_book(extracted_path)
+
+        raw = Path(extracted_path).read_bytes()
+        html, text = _clean_html_and_text(raw)
+        title = Path(path).stem
+        metadata = {"title": title, "author": None, "description": ""}
+
+        chapters: list[Chapter] = []
+        split = _split_by_chapter_markers(text)
+        if split is not None:
+            for sub_title, sub_text in split:
+                chapters.append(Chapter(
+                    index=len(chapters), title=sub_title, html=_text_to_html(sub_text), text=sub_text,
+                ))
+        elif text:
+            chapters.append(Chapter(index=0, title=title, html=html, text=text))
+
+        return metadata, chapters
+    finally:
+        shutil.rmtree(book_dir, ignore_errors=True)
