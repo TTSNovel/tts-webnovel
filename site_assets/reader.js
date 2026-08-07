@@ -38,8 +38,20 @@
   let paused = false;
   const preloadCache = {};
   const preloadReady = new Set();
-  let currentAudio = null;
+  // Single Audio element reused for the whole session (never recreated or
+  // discarded) rather than `new Audio()` per sentence — once it has played
+  // due to a user gesture, iOS keeps allowing .play() on THIS element
+  // without a fresh gesture, for as long as the document stays alive.
+  let audioEl = null;
   let autoStopTimer = null;
+  // Background prefetch of the next chapter's content + first-sentence
+  // audio, kicked off as soon as the current chapter starts (see
+  // prefetchNextChapterIfNeeded). Without this, auto-advance has to fetch
+  // both the new chapter's HTML and its first TTS clip live at the chapter
+  // boundary — two real network round trips with no audio playing, which
+  // breaks the "next .play() follows closely after the previous `ended`"
+  // continuity iOS Safari requires to keep allowing gesture-less autoplay.
+  let nextChapterPrefetch = null;
 
   // Chapter-page identity, resolved once on load from the URL + meta.json
   // (see initChapterPage) and kept current by goToChapter() on every jump.
@@ -110,6 +122,52 @@
     return result;
   }
 
+  // Same sentence-splitting logic as wrapContentSentences, but for a
+  // detached fragment (prefetched chapter HTML not yet in the document) —
+  // uses textContent instead of innerText since innerText needs the node
+  // to actually be laid out/rendered, which a detached container never is.
+  function firstSentenceOf(html) {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    const nodes = tmp.querySelectorAll('p, h1, h2, h3, h4, li');
+    for (const node of nodes) {
+      if (node.dataset.readerSkip !== undefined) continue;
+      const text = node.textContent.trim();
+      if (!text || text.length < 3) continue;
+      const parts = splitSentences(text);
+      if (parts.length) return parts[0];
+    }
+    return null;
+  }
+
+  // Kicks off (once per chapter) a background fetch of the next chapter's
+  // HTML fragment plus its first sentence's TTS audio, well ahead of when
+  // auto-advance will actually need them — see the nextChapterPrefetch
+  // comment above for why this matters on iOS. Best-effort: on failure the
+  // chapter-boundary code just falls back to a live fetch, same as before.
+  function prefetchNextChapterIfNeeded() {
+    if (localStorage.getItem('reader.autoNext') !== '1') return;
+    const nextNum = currentChapterNum + 1;
+    if (nextNum >= totalChapters) return;
+    if (nextChapterPrefetch && nextChapterPrefetch.num === nextNum) return;
+
+    const entry = { num: nextNum, html: null, audioPromise: null };
+    nextChapterPrefetch = entry;
+    fetch(`/books/${bookSlug}/data/${pad4(nextNum)}.html`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`fetch chapter failed: ${r.status}`);
+        return r.text();
+      })
+      .then((html) => {
+        entry.html = html;
+        const firstSentence = firstSentenceOf(html);
+        if (firstSentence) entry.audioPromise = fetchAudioUrl(firstSentence);
+      })
+      .catch(() => {
+        /* best-effort prefetch; boundary code falls back to a live fetch */
+      });
+  }
+
   function highlightSentence(i) {
     document.querySelectorAll('[data-r-s].reading').forEach((el) => el.classList.remove('reading'));
     const span = document.querySelector(`[data-r-s="${i}"]`);
@@ -153,11 +211,15 @@
 
   function playAudioUrl(url) {
     return new Promise((resolve, reject) => {
-      currentAudio = new Audio(url);
-      currentAudio.onended = resolve;
-      currentAudio.onerror = reject;
+      if (!audioEl) {
+        audioEl = new Audio();
+        audioEl.preload = 'auto';
+      }
+      audioEl.src = url;
+      audioEl.onended = resolve;
+      audioEl.onerror = reject;
       if (!paused) {
-        currentAudio.play().catch((err) => {
+        audioEl.play().catch((err) => {
           if (err.name === 'NotAllowedError') {
             // Browser autoplay policy blocked playback (no direct user
             // gesture yet in this document). Pause and wait instead of
@@ -232,10 +294,14 @@
   // place — no navigation, so the audio-unlock state (and this whole
   // script's in-memory state) survives across chapters. Throws on failure;
   // callers decide how to react.
-  async function goToChapter(num) {
-    const resp = await fetch(`/books/${bookSlug}/data/${pad4(num)}.html`);
-    if (!resp.ok) throw new Error(`fetch chapter failed: ${resp.status}`);
-    document.querySelector('article').innerHTML = await resp.text();
+  async function goToChapter(num, prefetchedHtml) {
+    let html = prefetchedHtml;
+    if (html == null) {
+      const resp = await fetch(`/books/${bookSlug}/data/${pad4(num)}.html`);
+      if (!resp.ok) throw new Error(`fetch chapter failed: ${resp.status}`);
+      html = await resp.text();
+    }
+    document.querySelector('article').innerHTML = html;
 
     currentChapterNum = num;
     updateChapterNav();
@@ -276,6 +342,7 @@
         if (!active) break;
 
         const i = index;
+        if (i === 0) prefetchNextChapterIfNeeded();
         if (!preloadCache[i]) preloadSentence(i);
 
         let url;
@@ -308,9 +375,13 @@
       const hasNext = currentChapterNum < totalChapters - 1;
       if (!(autoNext && hasNext)) break;
 
+      const nextNum = currentChapterNum + 1;
+      const prefetched = nextChapterPrefetch && nextChapterPrefetch.num === nextNum ? nextChapterPrefetch : null;
+      nextChapterPrefetch = null;
+
       els.status.textContent = 'Đang chuyển chương…';
       try {
-        await goToChapter(currentChapterNum + 1);
+        await goToChapter(nextNum, prefetched ? prefetched.html ?? undefined : undefined);
       } catch (e) {
         els.status.textContent = 'Lỗi tải chương tiếp theo';
         break;
@@ -319,6 +390,23 @@
       sentences = wrapContentSentences(document.querySelector('article'));
       index = 0;
       if (!sentences.length) break;
+      // Reuse the prefetched first-sentence audio (if it's ready) instead of
+      // starting a fresh fetch here — keeps the upcoming .play() close to
+      // the previous sentence's `ended` event, same reason as the prefetch
+      // itself (see nextChapterPrefetch comment near the top of the file).
+      if (prefetched && prefetched.audioPromise) {
+        preloadCache[0] = prefetched.audioPromise
+          .then((url) => {
+            preloadReady.add(0);
+            updateProgress();
+            return url;
+          })
+          .catch((err) => {
+            preloadReady.add(0);
+            updateProgress();
+            throw err;
+          });
+      }
       els.status.textContent = '';
       updateMediaSessionMetadata();
     }
@@ -343,14 +431,14 @@
 
   function pause() {
     paused = true;
-    if (currentAudio) currentAudio.pause();
+    if (audioEl) audioEl.pause();
     updatePlayBtn();
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
   }
 
   function resume() {
     paused = false;
-    if (currentAudio) currentAudio.play().catch(() => {});
+    if (audioEl) audioEl.play().catch(() => {});
     updatePlayBtn();
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
   }
@@ -359,10 +447,10 @@
     active = false;
     paused = false;
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
-    if (currentAudio) {
-      currentAudio.pause();
-      currentAudio = null;
-    }
+    // audioEl itself is kept alive (not nulled) across stop/start within the
+    // same page — that's what preserves iOS's "this element already played
+    // due to a user gesture" autoplay allowance for the rest of the session.
+    if (audioEl) audioEl.pause();
     dropPreloadedAudio();
     updatePlayBtn();
   }
@@ -385,6 +473,7 @@
     const wasActive = active;
     if (wasActive) stop();
     if (els) els.status.textContent = '';
+    nextChapterPrefetch = null; // was for the old currentChapterNum + 1, now stale
 
     try {
       await goToChapter(num);
@@ -506,6 +595,7 @@
     els.autoNext.checked = localStorage.getItem('reader.autoNext') === '1';
     els.autoNext.addEventListener('change', () => {
       localStorage.setItem('reader.autoNext', els.autoNext.checked ? '1' : '0');
+      if (els.autoNext.checked && active) prefetchNextChapterIfNeeded();
     });
 
     els.autoStopMinutes.value = localStorage.getItem('reader.autoStopMinutes') || '30';
