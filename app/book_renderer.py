@@ -35,6 +35,15 @@ def cover_initial(title: str) -> str:
     return "?"
 
 
+def cover_html(title: str, cover_url: str | None) -> str:
+    """A real cover <img> when the book has one, else the gradient/initial
+    placeholder div — same "cover" class either way so book-card/book-header
+    sizing (aspect-ratio, border-radius, shadow) applies uniformly."""
+    if cover_url:
+        return f'<img class="cover" src="{html.escape(cover_url)}" alt="" loading="lazy">'
+    return f'<div class="cover" style="background:{cover_gradient(title)}">{html.escape(cover_initial(title))}</div>'
+
+
 _CSS = """
 :root {
   --bg: #fafafa; --surface: #ffffff; --text: #1a1a1a; --muted: #6b7280;
@@ -47,15 +56,33 @@ _CSS = """
   }
 }
 * { box-sizing: border-box; }
+/* iOS Safari's elastic rubber-band overscroll pulls the viewport past the
+   real page bounds — anything not covered by an opaque background there
+   (by default just <body>, not <html>) exposes whatever is compositing
+   behind the page for that instant, which on iOS shows through the
+   WKWebView's own rounded-corner frame: a flash of rounded corners plus
+   whatever color/content sits behind it (home screen, previous app). Was
+   visible as a broken-looking sticky header on scroll. overscroll-behavior
+   removes the bounce outright (root cause); the html background is a
+   defensive second layer in case some browser still allows a sliver through. */
+html { background: var(--bg); overscroll-behavior-y: none; }
 body {
   margin: 0; background: var(--bg); color: var(--text);
   font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  overscroll-behavior-y: none;
 }
 a { color: inherit; text-decoration: none; }
 .topbar {
   position: sticky; top: 0; z-index: 10; display: flex; align-items: center;
   gap: .75rem; padding: .75rem 1.25rem; background: var(--surface);
   border-bottom: 1px solid var(--border);
+  /* viewport-fit=cover lets this sticky-to-top bar's box start above y=0
+     of the old "safe" layout viewport, i.e. behind the status bar/notch —
+     padding-top pushes the actual back-link/title down below that area
+     while the bar's own background still fills all the way up, so no page
+     content (book cover colors, chapter text) is ever visible through/
+     behind the status bar as the page scrolls underneath it. */
+  padding-top: calc(.75rem + env(safe-area-inset-top));
 }
 .topbar .back { color: var(--accent); font-weight: 600; white-space: nowrap; }
 .topbar .book-title { color: var(--muted); font-size: .9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -66,6 +93,8 @@ a { color: inherit; text-decoration: none; }
 .site-topbar {
   position: sticky; top: 0; z-index: 10; display: flex; flex-direction: column; gap: .6rem;
   padding: .7rem 1.1rem; background: var(--surface); border-bottom: 1px solid var(--border);
+  /* see .topbar above — same reasoning, this is the home page's header */
+  padding-top: calc(.7rem + env(safe-area-inset-top));
 }
 .site-topbar-row { display: flex; align-items: center; gap: .6rem; }
 .site-topbar h1 {
@@ -95,6 +124,10 @@ a { color: inherit; text-decoration: none; }
   box-shadow: 0 2px 10px rgba(0,0,0,.18); transition: transform .15s ease;
 }
 .book-card:hover .cover { transform: translateY(-3px); }
+/* Real cover <img> reuses the same .cover class for sizing/shadow — this
+   just makes it fill that box (placeholder divs size via flex+aspect-ratio
+   alone, but a replaced element like <img> needs an explicit width/fit). */
+img.cover { width: 100%; height: 100%; object-fit: cover; display: block; }
 .book-card .title { font-weight: 600; font-size: .9rem; line-height: 1.35; }
 .book-card .author { color: var(--muted); font-size: .78rem; }
 .book-card .meta { color: var(--muted); font-size: .75rem; }
@@ -141,7 +174,8 @@ article p { margin: 0 0 1.1em; font-size: 1.05rem; }
    shifts/jumps left-right on every text change. Fixed width + ellipsis
    truncation inside keeps its position and size completely static. */
 .reader-bar {
-  position: fixed; left: 50%; bottom: 1rem; transform: translateX(-50%);
+  position: fixed; left: 50%; transform: translateX(-50%);
+  bottom: calc(1rem + env(safe-area-inset-bottom));
   display: flex; align-items: center; gap: .5rem; padding: .5rem .75rem;
   width: min(92vw, 340px);
   background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
@@ -159,7 +193,8 @@ article p { margin: 0 0 1.1em; font-size: 1.05rem; }
 }
 
 .reader-settings {
-  position: fixed; left: 50%; bottom: 4.5rem; transform: translateX(-50%);
+  position: fixed; left: 50%; transform: translateX(-50%);
+  bottom: calc(4.5rem + env(safe-area-inset-bottom));
   display: flex; flex-direction: column; gap: .7rem; width: min(90vw, 320px);
   padding: 1rem 1.1rem; background: var(--surface); border: 1px solid var(--border);
   border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.15); z-index: 20;
@@ -258,7 +293,7 @@ _CHAPTER_SHELL = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Đang tải… — Thư viện truyện</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {pwa_head}
 <style>{css}</style>
 </head>
@@ -287,7 +322,7 @@ _BOOK_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>{book_title}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {pwa_head}
 <style>{css}</style>
 </head>
@@ -298,7 +333,7 @@ _BOOK_PAGE = """<!doctype html>
 </div>
 <div class="wrap">
   <header class="book-header">
-    <div class="cover" style="background:{cover_gradient}">{cover_initial}</div>
+    {cover_html}
     <div class="info">
       <h1>{book_title}</h1>
       {author_html}
@@ -324,7 +359,7 @@ _INDEX_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Thư viện truyện</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {pwa_head}
 <style>{css}</style>
 </head>
@@ -355,7 +390,7 @@ _INDEX_PAGE = """<!doctype html>
 """
 
 _BOOK_CARD = """    <a class="book-card" href="books/{id}/index.html" data-title="{title_lower}">
-      <div class="cover" style="background:{cover_gradient}">{cover_initial}</div>
+      {cover_html}
       <span class="title">{title}</span>
       {author_html}
       <span class="meta">{n} chương</span>
@@ -381,7 +416,9 @@ def render_book_meta(title: str, author: str | None, category: str, n: int) -> s
     return json.dumps({"title": title, "author": author, "category": category, "n": n}, ensure_ascii=False)
 
 
-def render_book_page(book_id: int, book_title: str, author: str | None, category: str, chapters) -> str:
+def render_book_page(
+    book_id: int, book_title: str, author: str | None, category: str, chapters, cover: str | None = None
+) -> str:
     filenames = [f"{ch.index:04d}.html" for ch in chapters]
     items = "\n".join(
         f'    <li><a href="chapters/{fname}"><span class="num">{ch.index + 1}</span>'
@@ -394,8 +431,7 @@ def render_book_page(book_id: int, book_title: str, author: str | None, category
         pwa_head=_PWA_HEAD,
         book_id=book_id,
         book_title=html.escape(book_title),
-        cover_gradient=cover_gradient(book_title),
-        cover_initial=html.escape(cover_initial(book_title)),
+        cover_html=cover_html(book_title, cover),
         author_html=author_html,
         n=len(chapters),
         category=html.escape(category),
@@ -410,12 +446,12 @@ def render_index_page(books_by_category: dict[str, list[dict]]) -> str:
         cards = []
         for b in books:
             author_html = f'<span class="author">{html.escape(b["author"])}</span>' if b.get("author") else ""
+            cover_url = f'books/{b["id"]}/{b["cover"]}' if b.get("cover") else None
             cards.append(_BOOK_CARD.format(
                 id=b["id"],
                 title=html.escape(b["title"]),
                 title_lower=html.escape(b["title"].lower()),
-                cover_gradient=cover_gradient(b["title"]),
-                cover_initial=html.escape(cover_initial(b["title"])),
+                cover_html=cover_html(b["title"], cover_url),
                 author_html=author_html,
                 n=b["n"],
             ))

@@ -37,7 +37,7 @@ from book_renderer import (
     render_index_page,
 )
 from classify import classify
-from epub_parser import extract_book, extract_book_from_mobi
+from epub_parser import extract_book, extract_book_from_mobi, extract_cover
 
 _LEGACY_EXTENSIONS = {".prc", ".mobi", ".azw3"}
 _JUNK_TITLE_MARKERS = ("created with", "written by", "gettextfromhtml")
@@ -98,12 +98,23 @@ def add_book_to_site(site_dir: Path, epub_path: Path, used_ids: set[int]) -> dic
     data_dir = book_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    cover_name = None
+    if epub_path.suffix.lower() not in _LEGACY_EXTENSIONS:
+        cover = extract_cover(str(epub_path))
+        if cover is not None:
+            cover_bytes, ext = cover
+            cover_name = f"cover.{ext}"
+            (book_dir / cover_name).write_bytes(cover_bytes)
+
     for ch in chapters:
         fragment = render_chapter_fragment(ch)
         (data_dir / f"{ch.index:04d}.html").write_text(fragment, encoding="utf-8")
 
     (book_dir / "index.html").write_text(
-        render_book_page(book_id=book_id, book_title=book_title, author=author, category=category, chapters=chapters),
+        render_book_page(
+            book_id=book_id, book_title=book_title, author=author, category=category,
+            chapters=chapters, cover=cover_name,
+        ),
         encoding="utf-8",
     )
     (book_dir / "meta.json").write_text(
@@ -111,7 +122,10 @@ def add_book_to_site(site_dir: Path, epub_path: Path, used_ids: set[int]) -> dic
         encoding="utf-8",
     )
 
-    return {"id": book_id, "title": book_title, "author": author, "category": category, "n": len(chapters)}
+    return {
+        "id": book_id, "title": book_title, "author": author, "category": category,
+        "n": len(chapters), "cover": cover_name,
+    }
 
 
 def write_index(site_dir: Path, manifest: list[dict]) -> None:

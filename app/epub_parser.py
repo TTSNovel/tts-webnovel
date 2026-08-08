@@ -345,6 +345,22 @@ def extract_book(epub_path: str) -> tuple[dict, list[Chapter]]:
     return metadata, _extract_chapters_from_book(book)
 
 
+_COVER_EXTENSIONS = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
+
+
+def extract_cover(epub_path: str) -> tuple[bytes, str] | None:
+    """Return (image_bytes, file_extension) for the epub's embedded cover
+    image, or None if it has no properly-flagged cover. Legacy .prc/.mobi
+    inputs aren't supported (PalmDOC has no structured cover slot to read
+    without a full repack) — callers should just skip the cover for those."""
+    book = epub.read_epub(epub_path, options={"ignore_ncx": True})
+    cover_item = next((i for i in book.get_items() if isinstance(i, epub.EpubCover)), None)
+    if cover_item is None:
+        return None
+    ext = _COVER_EXTENSIONS.get(cover_item.media_type, "jpg")
+    return cover_item.get_content(), ext
+
+
 def extract_book_from_mobi(path: str) -> tuple[dict, list[Chapter]]:
     """Extract a legacy .prc/.mobi/.azw3 file's chapters.
 
