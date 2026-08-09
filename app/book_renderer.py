@@ -35,12 +35,24 @@ def cover_initial(title: str) -> str:
     return "?"
 
 
-def cover_html(title: str, cover_url: str | None) -> str:
+def cover_html(title: str, cover_url: str | None, defer: bool = False) -> str:
     """A real cover <img> when the book has one, else the gradient/initial
     placeholder div — same "cover" class either way so book-card/book-header
-    sizing (aspect-ratio, border-radius, shadow) applies uniformly."""
+    sizing (aspect-ratio, border-radius, shadow) applies uniformly.
+
+    defer=True emits data-src instead of src — the browser never fetches it
+    on its own. Used for the home page's grid, which can have dozens of
+    these on one page: firing all of them as real <img src> immediately
+    (even with loading="lazy", which only defers off-screen ones, not the
+    many still near the initial viewport) queued behind each other badly
+    on a real device with no network — measured live at ~4.5s of pure
+    "Queued" time, dwarfing every other part of the page load. download.js
+    resolves data-src into real src only after it's confirmed online (or,
+    offline, reads straight from Cache Storage for downloaded books) —
+    the browser is never left to fire a request storm on its own."""
     if cover_url:
-        return f'<img class="cover" src="{html.escape(cover_url)}" alt="" loading="lazy">'
+        attr = "data-src" if defer else "src"
+        return f'<img class="cover" {attr}="{html.escape(cover_url)}" alt="" loading="lazy">'
     return f'<div class="cover" style="background:{cover_gradient(title)}">{html.escape(cover_initial(title))}</div>'
 
 
@@ -85,7 +97,18 @@ a { color: inherit; text-decoration: none; }
   padding-top: calc(.75rem + env(safe-area-inset-top));
 }
 .topbar .back { color: var(--accent); font-weight: 600; white-space: nowrap; }
-.topbar .book-title { color: var(--muted); font-size: .9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.book-title {
+  flex: 1; min-width: 0; color: var(--muted); font-size: .9rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Chapter page's own header row (menu + title) — deliberately NOT sticky;
+   it scrolls away with the content. Only .chapter-nav-sticky below stays
+   pinned, so scrolling doesn't keep a big header permanently on screen. */
+.chapter-header {
+  display: flex; align-items: center; gap: .75rem; padding: .75rem 1.25rem;
+  padding-top: calc(.75rem + env(safe-area-inset-top));
+  background: var(--surface); border-bottom: 1px solid var(--border);
+}
 .wrap { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 6rem; }
 .wrap.narrow { max-width: 720px; }
 
@@ -132,8 +155,15 @@ img.cover { width: 100%; height: 100%; object-fit: cover; display: block; }
 .book-card .author { color: var(--muted); font-size: .78rem; }
 .book-card .meta { color: var(--muted); font-size: .75rem; }
 .book-card[hidden] { display: none; }
+/* Filled in client-side by progress.js (GET /api/progress) — the card
+   itself is a static pre-rendered file, so per-account reading position
+   can't be baked in at generation time like the rest of the card. */
+.progress-badge { display: block; margin-top: .1rem; font-size: .72rem; color: var(--accent); font-weight: 600; }
 
 /* book page */
+/* Filled in client-side by progress.js, same reasoning as .progress-badge
+   above — reuses .dl-btn's existing pill style rather than new button CSS. */
+.book-reading-actions { display: flex; gap: .5rem; margin-top: 1rem; flex-wrap: wrap; }
 .book-header { display: flex; gap: 1.5rem; align-items: flex-start; margin-bottom: 2rem; }
 .book-header .cover {
   width: 120px; aspect-ratio: 2 / 3; flex: none; border-radius: 12px; display: flex;
@@ -158,39 +188,71 @@ img.cover { width: 100%; height: 100%; object-fit: cover; display: block; }
 article h1 { font-size: 1.4rem; margin: 0 0 1.5rem; }
 article p { margin: 0 0 1.1em; font-size: 1.05rem; }
 [data-r-s].reading { background-color: rgba(255, 220, 50, 0.6); border-radius: 3px; outline: 2px solid rgba(255, 180, 0, 0.65); outline-offset: 1px; }
-.chapter-nav { display: flex; gap: .6rem; margin-top: 2.5rem; }
-.btn {
-  flex: 1; text-align: center; padding: .7rem 1rem; border-radius: 8px;
-  border: 1px solid var(--border); background: var(--surface); font-weight: 600;
-}
-.btn:hover { background: var(--hover); }
-.btn.disabled { opacity: .4; pointer-events: none; }
-.btn-primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 
-/* reader control bar — fixed width on purpose: status/progress text length
-   changes constantly during playback (chapter transitions, TTS errors,
-   model-download percentages), and this bar is centered via left:50% +
-   translateX(-50%), so if its width were content-driven it visibly
-   shifts/jumps left-right on every text change. Fixed width + ellipsis
-   truncation inside keeps its position and size completely static. */
+/* Small round icon button — the topbar's "‹ Mục lục" menu link. */
+.icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 2rem; height: 2rem; flex: none; border-radius: 999px;
+  font-size: 1.15rem; color: var(--text);
+}
+.icon-btn:hover { background: var(--hover); }
+
+/* Chapter prev/next/menu nav — one shared style, used both in the sticky
+   row right under the (non-sticky) header and again below the article, so
+   it reads as the same clear, bordered button in both places instead of
+   the tiny inline icons this used to be. */
+.chapter-nav-row { display: flex; gap: .5rem; }
+.chapter-nav-row.chapter-nav-bottom { margin-top: 2.5rem; }
+/* This is the ONLY part of the chapter page that stays pinned while
+   scrolling — the header above (menu + book title) deliberately isn't, so
+   scrolling doesn't keep a tall header permanently on screen, just the
+   prev/next controls. No extra safe-area padding here (unlike
+   .chapter-header): this row sits right below the header in normal flow,
+   not at the very top of the page, so adding env(safe-area-inset-top)
+   unconditionally just added dead space above it before it ever actually
+   reaches the top — most visible on an iOS home-screen PWA, where that
+   inset is a real non-zero value (plain Safari tabs mostly report 0 there
+   since the address bar already occupies the space). The handoff at
+   scroll time is still safe: .chapter-header already covers the notch at
+   scroll 0, and this row has the same opaque background with no gap
+   between them, so nothing is ever left uncovered as one replaces the
+   other while scrolling. */
+.chapter-nav-row.chapter-nav-sticky {
+  position: sticky; top: 0; z-index: 10;
+  padding: .4rem 1.25rem;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+}
+.nav-btn {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  height: 2rem; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--surface); font-size: 1.1rem; color: var(--text);
+}
+.nav-btn:hover { background: var(--hover); }
+.nav-btn.disabled { opacity: .35; pointer-events: none; }
+
+/* reader control bar — kept deliberately minimal: play, progress, settings
+   only. Chapter/menu nav lives in the topbar row + below the article, not
+   here. Fixed width so it stays centered via left:50% + translateX(-50%)
+   without visibly shifting/jumping left-right if its content ever changes. */
 .reader-bar {
   position: fixed; left: 50%; transform: translateX(-50%);
   bottom: calc(1rem + env(safe-area-inset-bottom));
   display: flex; align-items: center; gap: .5rem; padding: .5rem .75rem;
-  width: min(92vw, 340px);
+  width: min(70vw, 200px);
   background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
   box-shadow: 0 4px 16px rgba(0,0,0,.15); z-index: 20;
 }
 .reader-btn {
   width: 2.4rem; height: 2.4rem; flex: none; border-radius: 50%; border: none;
   background: var(--accent); color: var(--accent-text); font-size: 1rem; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
 }
 .reader-btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); font-size: 1.1rem; }
-.reader-progress { font-size: .85rem; color: var(--muted); width: 4.5rem; flex: none; text-align: center; }
-.reader-status {
-  font-size: .8rem; color: var(--muted); flex: 1; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+.reader-progress {
+  display: flex; flex-direction: column; align-items: center; line-height: 1.25;
+  font-size: .85rem; color: var(--muted); width: 4.5rem; flex: none; text-align: center;
 }
+.reader-preload { font-size: .68rem; opacity: .75; }
 
 .reader-settings {
   position: fixed; left: 50%; transform: translateX(-50%);
@@ -223,18 +285,17 @@ article p { margin: 0 0 1.1em; font-size: 1.05rem; }
 .import-form .msg.ok { background: rgba(22,163,74,.15); color: #16a34a; }
 .import-form .msg.err { background: rgba(220,38,38,.15); color: #dc2626; }
 
-/* download page */
+/* download page — same .book-grid/.book-card as the home page, just with
+   an extra Cập nhật/Xoá button row under the cover. */
 .book-dl { margin-top: 1rem; }
 .book-dl .dl-progress { max-width: 220px; }
 .dl-hint { color: var(--muted); font-size: .9rem; }
-.dl-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: var(--surface); }
-.dl-row { display: flex; align-items: center; gap: 1rem; padding: .9rem 1.1rem; }
-.dl-row + .dl-row { border-top: 1px solid var(--border); }
-.dl-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: .15rem; }
-.dl-title { font-weight: 600; font-size: .95rem; }
-a.dl-title:hover { color: var(--accent); }
-.dl-author, .dl-meta { color: var(--muted); font-size: .78rem; }
-.dl-progress { height: 4px; border-radius: 999px; background: var(--hover); margin-top: .4rem; overflow: hidden; }
+.dl-list-actions { display: flex; justify-content: flex-end; margin-bottom: .75rem; }
+.dl-card-actions { display: flex; gap: .4rem; }
+.dl-card .title, .dl-card .author { display: block; }
+a.dl-card .title:hover { color: var(--accent); }
+.dl-meta { color: var(--muted); font-size: .75rem; }
+.dl-progress { height: 4px; border-radius: 999px; background: var(--hover); margin-top: .2rem; overflow: hidden; }
 .dl-progress[hidden] { display: none; }
 .dl-progress-bar { height: 100%; width: 0; background: var(--accent); transition: width .2s ease; }
 .dl-btn {
@@ -245,6 +306,10 @@ a.dl-title:hover { color: var(--accent); }
 .dl-btn:not(:disabled):not(.dl-btn-danger):hover { border-color: var(--accent); color: var(--accent); }
 .dl-btn-danger { border-color: transparent; background: transparent; color: #dc2626; }
 .dl-btn-danger:hover { background: rgba(220,38,38,.12); }
+/* Smaller variant for the 2 buttons under each downloaded book's cover —
+   the standalone "Tải xuống để đọc offline" button on a book's own page
+   (also .dl-btn) stays full-size; only scoped here. */
+.dl-card-actions .dl-btn { flex: 1; padding: .35rem .4rem; font-size: .7rem; }
 
 /* Piper-offline model management, on the Download page — a big, easy-to-
    hit target on its own page, not squeezed into the reader's small
@@ -298,16 +363,20 @@ _CHAPTER_SHELL = """<!doctype html>
 <style>{css}</style>
 </head>
 <body>
-<div class="topbar">
-  <a class="back" href="../index.html">‹ Mục lục</a>
+<div class="chapter-header">
+  <a class="icon-btn" href="../index.html" title="Mục lục">☰</a>
   <span class="book-title"></span>
 </div>
+<nav class="chapter-nav-row chapter-nav-sticky">
+  <a class="nav-btn disabled" data-chapter-nav="prev" title="Chương trước">‹</a>
+  <a class="nav-btn disabled" data-chapter-nav="next" rel="next" title="Chương tiếp theo">›</a>
+</nav>
 <div class="wrap narrow">
   <article></article>
-  <nav class="chapter-nav">
-    <a class="btn disabled" data-chapter-nav="prev" href="#">‹ Chương trước</a>
-    <a class="btn" href="../index.html">Mục lục</a>
-    <a class="btn btn-primary disabled" data-chapter-nav="next" rel="next" href="#">Chương tiếp theo ›</a>
+  <nav class="chapter-nav-row chapter-nav-bottom">
+    <a class="nav-btn disabled" data-chapter-nav="prev" title="Chương trước">‹</a>
+    <a class="nav-btn" href="../index.html" title="Mục lục">☰</a>
+    <a class="nav-btn disabled" data-chapter-nav="next" rel="next" title="Chương tiếp theo">›</a>
   </nav>
 </div>
 <script src="../../../assets/download.js"></script>
@@ -339,6 +408,7 @@ _BOOK_PAGE = """<!doctype html>
       {author_html}
       <p class="count">{n} chương</p>
       <span class="category-badge">{category}</span>
+      <div class="book-reading-actions" id="book-reading-actions" data-book-id="{book_id}"></div>
       <div class="book-dl">
         <button class="dl-btn" id="book-dl-btn" data-book-id="{book_id}">Tải xuống để đọc offline</button>
         <div class="dl-progress" id="book-dl-progress" hidden><div class="dl-progress-bar"></div></div>
@@ -350,6 +420,7 @@ _BOOK_PAGE = """<!doctype html>
   </ol>
 </div>
 <script src="/assets/download.js"></script>
+<script src="/assets/progress.js"></script>
 </body>
 </html>
 """
@@ -385,11 +456,12 @@ _INDEX_PAGE = """<!doctype html>
 {categories}
 </div>
 <script src="/assets/download.js"></script>
+<script src="/assets/progress.js"></script>
 </body>
 </html>
 """
 
-_BOOK_CARD = """    <a class="book-card" href="books/{id}/index.html" data-title="{title_lower}">
+_BOOK_CARD = """    <a class="book-card" href="books/{id}/index.html" data-id="{id}" data-title="{title_lower}">
       {cover_html}
       <span class="title">{title}</span>
       {author_html}
@@ -408,12 +480,29 @@ def render_chapter_fragment(chapter) -> str:
     return f"<h1>{html.escape(chapter.title)}</h1>\n{chapter.html}"
 
 
-def render_book_meta(title: str, author: str | None, category: str, n: int) -> str:
+def render_chapter_titles(chapters) -> str:
+    """books/<id>/titles.json — every chapter's title, in order, with no
+    other content. Lets a client render a full chapter-list/picker without
+    fetching each chapter's full HTML fragment (render_chapter_fragment)
+    just to read its <h1> — for a several-thousand-chapter book that's the
+    difference between 1 small request and thousands of large ones. Kept
+    separate from render_book_meta's meta.json (fetched on every single
+    chapter-page load) so that per-chapter-page cost doesn't grow with a
+    book's chapter count."""
+    return json.dumps([ch.title for ch in chapters], ensure_ascii=False)
+
+
+def render_book_meta(title: str, author: str | None, category: str, n: int, cover: str | None = None) -> str:
     """Small per-book manifest reader.js fetches once per chapter-page load
     to fill in the topbar title and compute prev/next-disabled state (needs
     the total chapter count) — far cheaper than re-deriving this from the
-    book's full chapter-list page."""
-    return json.dumps({"title": title, "author": author, "category": category, "n": n}, ensure_ascii=False)
+    book's full chapter-list page. Also the only way download.js's
+    downloadBook() (fetched from a different origin context than the
+    server-rendered book page) learns the cover's filename, so it knows
+    what to fetch alongside the chapters for offline use."""
+    return json.dumps(
+        {"title": title, "author": author, "category": category, "n": n, "cover": cover}, ensure_ascii=False
+    )
 
 
 def render_book_page(
@@ -451,7 +540,7 @@ def render_index_page(books_by_category: dict[str, list[dict]]) -> str:
                 id=b["id"],
                 title=html.escape(b["title"]),
                 title_lower=html.escape(b["title"].lower()),
-                cover_html=cover_html(b["title"], cover_url),
+                cover_html=cover_html(b["title"], cover_url, defer=True),
                 author_html=author_html,
                 n=b["n"],
             ))

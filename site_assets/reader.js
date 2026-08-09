@@ -29,6 +29,19 @@
 (function () {
   'use strict';
 
+  // Stamped at deploy time — logged so a stale cached copy of this file
+  // is obvious at a glance instead of a guess (see sw.js's own version log
+  // for the same reasoning).
+  const READER_JS_VERSION = '__DEPLOY_VERSION__';
+
+  // performance.now() is relative to navigation start, so this alone
+  // already answers "how long did the document/script loading itself
+  // take before reader.js even started running" — no separate timer
+  // needed just for that part.
+  console.log(
+    `reader.js: version ${READER_JS_VERSION}, script evaluated at ${performance.now().toFixed(0)}ms since navigation start`
+  );
+
   const MAX_TTS_CHARS = 150;
   const PRELOAD_AHEAD = 6;
 
@@ -43,6 +56,9 @@
   // due to a user gesture, iOS keeps allowing .play() on THIS element
   // without a fresh gesture, for as long as the document stays alive.
   let audioEl = null;
+  // Cached object URL for a tiny silent WAV clip, built once — see
+  // unlockAudioElement() below.
+  let silentClipUrl = null;
   let autoStopTimer = null;
   // Background prefetch of the next chapter's content + first-sentence
   // audio, kicked off as soon as the current chapter starts (see
@@ -67,6 +83,58 @@
 
   function pad4(n) {
     return String(n).padStart(4, '0');
+  }
+
+  // Reading-history sync — GET once per page load (in parallel with the
+  // chapter fetch, see bootstrap()), POST at milestones (pause, chapter
+  // navigation, tab hidden, tab close) rather than every sentence. Same
+  // backend (/api/progress) and cadence as the iOS app, since progress is
+  // account-wide, not device-specific.
+  async function fetchProgress() {
+    try {
+      const r = await fetch('/api/progress');
+      if (!r.ok) return {};
+      return await r.json();
+    } catch {
+      return {};
+    }
+  }
+
+  // `beacon: true` for the tab-hidden/page-unload cases — a plain fetch()
+  // started that late in a page's life isn't guaranteed to finish (or even
+  // start) before the page is actually torn down; sendBeacon is the
+  // browser-native "fire this even if the page is closing" primitive.
+  function postProgress(chapter, sentence, { beacon = false } = {}) {
+    if (!bookId) return;
+    const body = JSON.stringify({ book_id: parseInt(bookId, 10), chapter, sentence });
+    if (beacon && navigator.sendBeacon) {
+      navigator.sendBeacon('/api/progress', new Blob([body], { type: 'application/json' }));
+      return;
+    }
+    fetch('/api/progress', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }).catch(() => {});
+  }
+
+  // Runs once per page load, after both the chapter content and the saved
+  // progress are available. If this exact chapter matches what's saved,
+  // pre-splits into sentences and highlights/scrolls to the saved sentence
+  // — start()'s existing "if (!sentences.length) sentences = wrap..." guard
+  // then leaves `index` alone instead of resetting it to 0, so pressing ▶
+  // continues from here (same trick ReaderPlaybackController.prepareResume
+  // uses on iOS). Otherwise this is a fresh chapter visit (direct link,
+  // manual browsing) — record it as the new baseline immediately, same as
+  // a manual chapter jump would.
+  function applyResumeOrBaseline(progress) {
+    const saved = progress && progress[bookId];
+    if (saved && saved.chapter === currentChapterNum) {
+      sentences = wrapContentSentences(document.querySelector('article'));
+      if (sentences.length) {
+        index = Math.min(Math.max(saved.sentence, 0), sentences.length - 1);
+        highlightSentence(index);
+        updateProgress();
+      }
+    } else {
+      postProgress(currentChapterNum, 0);
+    }
   }
 
   function splitSentences(text) {
@@ -179,10 +247,39 @@
     if (span) span.scrollIntoView({ behavior: 'smooth', block: 'center' }), span.classList.add('reading');
   }
 
+  // Backgrounded/locked-screen tabs get their JS execution throttled hard
+  // by iOS — a pending fetch() or a message to the Piper-offline Worker can
+  // sit unanswered far longer than it would in the foreground, sometimes
+  // indefinitely. Without a bound, readLoop's `await preloadCache[i]`
+  // (see fetchAudioUrl below) just hangs forever: no error, no stop(), no
+  // way for the ▶ button to recognize anything needs retrying. Capping
+  // this turns a silent, unrecoverable hang into a normal, retryable
+  // failure (readLoop's existing catch → stop() → showReaderError()).
+  const TTS_TIMEOUT_MS = 20000;
+
+  function withTimeout(promise, ms) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`TTS timeout sau ${Math.round(ms / 1000)}s`)), ms);
+      promise.then(
+        (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        (e) => {
+          clearTimeout(timer);
+          reject(e);
+        }
+      );
+    });
+  }
+
   async function fetchAudioUrl(text) {
     const speed = parseFloat(localStorage.getItem('reader.speed') || '1.0');
     const model = localStorage.getItem('reader.model') || '';
+    return withTimeout(fetchAudioUrlUnbounded(text, model, speed), TTS_TIMEOUT_MS);
+  }
 
+  async function fetchAudioUrlUnbounded(text, model, speed) {
     if (model === 'piper_offline') {
       await ensurePiperOfflineReady();
       const blob = await window.PiperOffline.synthesize(cleanTextForTTS(text), speed);
@@ -221,12 +318,56 @@
     preloadReady.clear();
   }
 
+  function ensureAudioElement() {
+    if (!audioEl) {
+      audioEl = new Audio();
+      audioEl.preload = 'auto';
+    }
+    return audioEl;
+  }
+
+  // Builds (once) a ~0.1s silent WAV as a local blob URL — used purely to
+  // "unlock" audioEl below, never actually heard.
+  function buildSilentClipUrl() {
+    const sampleRate = 8000;
+    const numSamples = 800;
+    const buffer = new ArrayBuffer(44 + numSamples * 2);
+    const view = new DataView(buffer);
+    view.setUint32(0, 0x46464952, true); // "RIFF"
+    view.setUint32(4, 36 + numSamples * 2, true);
+    view.setUint32(8, 0x45564157, true); // "WAVE"
+    view.setUint32(12, 0x20746d66, true); // "fmt "
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, 1, true); // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    view.setUint32(36, 0x61746164, true); // "data"
+    view.setUint32(40, numSamples * 2, true);
+    // remaining bytes already zero-initialized == silence
+    return URL.createObjectURL(new Blob([buffer], { type: 'audio/wav' }));
+  }
+
+  // iOS Safari only exempts LATER .play() calls that happen outside a user
+  // gesture (e.g. after `await`-ing a TTS fetch) if this exact <audio>
+  // element has genuinely started real playback at least once *during* a
+  // gesture. Must be called synchronously from inside the tap handler,
+  // before any await — playing a real (if silent) clip right here "primes"
+  // audioEl so the real first-sentence .play() a moment later (once the
+  // TTS fetch resolves) is no longer blocked, without needing a 2nd tap.
+  function unlockAudioElement() {
+    const el = ensureAudioElement();
+    if (!silentClipUrl) silentClipUrl = buildSilentClipUrl();
+    el.src = silentClipUrl;
+    const p = el.play();
+    if (p && p.catch) p.catch(() => {});
+  }
+
   function playAudioUrl(url) {
     return new Promise((resolve, reject) => {
-      if (!audioEl) {
-        audioEl = new Audio();
-        audioEl.preload = 'auto';
-      }
+      ensureAudioElement();
       audioEl.src = url;
       audioEl.onended = resolve;
       audioEl.onerror = reject;
@@ -241,7 +382,7 @@
             // on this same Audio, which then fires onended normally).
             paused = true;
             updatePlayBtn();
-            if (els) els.status.textContent = 'Đã chặn tự phát — nhấn ▶ để tiếp tục';
+            showReaderError('Đã chặn tự phát — nhấn ▶ để tiếp tục', false);
           } else {
             reject(err);
           }
@@ -254,11 +395,29 @@
   function updateProgress() {
     if (!els) return;
     els.progress.textContent = `${Math.min(index + 1, sentences.length)} / ${sentences.length}`;
+    // preloadReady accumulates as each preloadSentence() call settles
+    // (success or failure) — this is simply "how many sentences' audio
+    // has been fetched so far", the same idea as the extension's own
+    // preload counter this was ported from.
+    els.preload.textContent = `${preloadReady.size} / ${sentences.length}`;
   }
 
   function updatePlayBtn() {
     if (!els) return;
     els.playBtn.textContent = active && !paused ? '⏸' : '▶';
+  }
+
+  // The reader-bar itself stays deliberately silent (no status text) —
+  // this is the only place playback errors surface now. autoOpen defaults
+  // to true (an error nobody sees isn't much better than none at all) —
+  // pass false for the one case that isn't really a failure (autoplay
+  // blocked on the very first tap, already visible via the ▶ button
+  // itself reverting), where popping the panel open would just be noise.
+  function showReaderError(message, autoOpen) {
+    if (!els || !els.errorBox) return;
+    els.errorBox.textContent = message;
+    els.errorBox.hidden = false;
+    if (autoOpen !== false) els.panel.hidden = false;
   }
 
   function scheduleAutoStop() {
@@ -279,7 +438,6 @@
   }
 
   function autoStopFire() {
-    if (els) els.status.textContent = 'Đã tự dừng';
     clearAutoStopState();
     stop();
   }
@@ -287,19 +445,19 @@
   // Reflects currentChapterNum/totalChapters onto the prev/next nav links —
   // called after every chapter load/jump since the shell ships with both
   // disabled by default (safe until we know where we actually are).
+  // querySelectorAll, not querySelector — prev/next each appear twice now
+  // (topbar + reader-bar), and both copies need to stay in sync.
   function updateChapterNav() {
-    const prevLink = document.querySelector('[data-chapter-nav="prev"]');
-    const nextLink = document.querySelector('[data-chapter-nav="next"]');
     const hasPrev = currentChapterNum > 0;
     const hasNext = currentChapterNum < totalChapters - 1;
-    if (prevLink) {
-      prevLink.classList.toggle('disabled', !hasPrev);
-      prevLink.href = hasPrev ? `${pad4(currentChapterNum - 1)}.html` : '#';
-    }
-    if (nextLink) {
-      nextLink.classList.toggle('disabled', !hasNext);
-      nextLink.href = hasNext ? `${pad4(currentChapterNum + 1)}.html` : '#';
-    }
+    document.querySelectorAll('[data-chapter-nav="prev"]').forEach((link) => {
+      link.classList.toggle('disabled', !hasPrev);
+      link.href = hasPrev ? `${pad4(currentChapterNum - 1)}.html` : '#';
+    });
+    document.querySelectorAll('[data-chapter-nav="next"]').forEach((link) => {
+      link.classList.toggle('disabled', !hasNext);
+      link.href = hasNext ? `${pad4(currentChapterNum + 1)}.html` : '#';
+    });
   }
 
   // Fetches a chapter's content fragment and injects it into <article> in
@@ -335,15 +493,33 @@
     bookId = m[1];
     const num = parseInt(m[2], 10);
 
-    const metaResp = await fetch(`/books/${bookId}/meta.json`);
-    if (!metaResp.ok) throw new Error(`fetch book meta failed: ${metaResp.status}`);
-    const meta = await metaResp.json();
+    // meta.json and this chapter's own content don't depend on each other
+    // (goToChapter only ever needed the chapter number from the URL) — run
+    // them in parallel rather than one after another. Offline, each fetch
+    // attempt can take up to the service worker's network timeout before
+    // falling back to cache (see sw.js's NETWORK_TIMEOUT_MS), so doing
+    // these sequentially doubled that worst-case wait on every single
+    // chapter-page load for no reason.
+    const tFetch = performance.now();
+    const [meta, chapterHtml] = await Promise.all([
+      fetch(`/books/${bookId}/meta.json`).then((r) => {
+        if (!r.ok) throw new Error(`fetch book meta failed: ${r.status}`);
+        return r.json();
+      }),
+      fetch(`/books/${bookId}/data/${pad4(num)}.html`).then((r) => {
+        if (!r.ok) throw new Error(`fetch chapter failed: ${r.status}`);
+        return r.text();
+      }),
+    ]);
+    console.log(`reader.js: meta.json + chapter fetch (parallel) took ${(performance.now() - tFetch).toFixed(0)}ms`);
     bookTitle = meta.title;
     totalChapters = meta.n;
-    const bookTitleEl = document.querySelector('.topbar .book-title');
+    const bookTitleEl = document.querySelector('.book-title');
     if (bookTitleEl) bookTitleEl.textContent = bookTitle;
 
-    await goToChapter(num);
+    const tRender = performance.now();
+    await goToChapter(num, chapterHtml);
+    console.log(`reader.js: goToChapter() render took ${(performance.now() - tRender).toFixed(0)}ms`);
     return true;
   }
 
@@ -376,7 +552,7 @@
           // blew through the rest of the chapter in seconds with nothing
           // ever actually played. index is left where it is so pressing
           // ▶ again retries this exact sentence instead of skipping it.
-          if (els) els.status.textContent = `Lỗi đọc câu ${i + 1}: ${(e && e.message) || e}`;
+          showReaderError(`Lỗi đọc câu ${i + 1}: ${(e && e.message) || e}`);
           clearAutoStopState();
           stop();
           return;
@@ -408,16 +584,17 @@
       const prefetched = nextChapterPrefetch && nextChapterPrefetch.num === nextNum ? nextChapterPrefetch : null;
       nextChapterPrefetch = null;
 
-      els.status.textContent = 'Đang chuyển chương…';
       try {
         await goToChapter(nextNum, prefetched ? prefetched.html ?? undefined : undefined);
       } catch (e) {
-        els.status.textContent = 'Lỗi tải chương tiếp theo';
+        console.error('reader.js: auto-advance failed to load next chapter ::', (e && e.message) || e);
+        showReaderError(`Lỗi tải chương tiếp theo: ${(e && e.message) || e}`);
         break;
       }
       dropPreloadedAudio(); // cached audio was keyed by the old chapter's sentence indices
       sentences = wrapContentSentences(document.querySelector('article'));
       index = 0;
+      postProgress(nextNum, 0);
       if (!sentences.length) break;
       // Reuse the prefetched first-sentence audio (if it's ready) instead of
       // starting a fresh fetch here — keeps the upcoming .play() close to
@@ -436,7 +613,6 @@
             throw err;
           });
       }
-      els.status.textContent = '';
       updateMediaSessionMetadata();
     }
 
@@ -463,6 +639,7 @@
     if (audioEl) audioEl.pause();
     updatePlayBtn();
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+    postProgress(currentChapterNum, index);
   }
 
   function resume() {
@@ -482,6 +659,7 @@
     if (audioEl) audioEl.pause();
     dropPreloadedAudio();
     updatePlayBtn();
+    postProgress(currentChapterNum, index);
   }
 
   // Escape / manual play-button-triggered stop ends the listening session
@@ -501,7 +679,6 @@
     if (num < 0 || num >= totalChapters) return;
     const wasActive = active;
     if (wasActive) stop();
-    if (els) els.status.textContent = '';
     nextChapterPrefetch = null; // was for the old currentChapterNum + 1, now stale
 
     try {
@@ -511,6 +688,7 @@
     }
     sentences = [];
     index = 0;
+    postProgress(num, 0);
     if (wasActive) start();
   }
 
@@ -571,6 +749,14 @@
       els.piperOfflineBtn.hidden = false;
       els.piperOfflineBtn.disabled = false;
       els.piperOfflineBtn.textContent = 'Xoá model';
+      // Load the model now (page load, or whenever this voice becomes
+      // selected) instead of waiting for the first ▶ press to pay for it —
+      // ensureModelLoaded() inside the worker is a no-op once already
+      // loaded, so calling this repeatedly (this function re-runs on every
+      // settings-panel refresh) costs nothing after the first real call.
+      window.PiperOffline.warmUp().catch((e) => {
+        console.warn('reader.js: Piper offline warm-up failed ::', (e && e.message) || e);
+      });
     } else {
       els.piperOfflineStatus.textContent = 'Chưa tải — sẽ tự tải khi bấm ▶ (~93MB)';
       els.piperOfflineBtn.hidden = true;
@@ -633,8 +819,10 @@
     bar.className = 'reader-bar';
     bar.innerHTML = `
       <button class="reader-btn" data-role="play">▶</button>
-      <span class="reader-progress" data-role="progress">0 / 0</span>
-      <span class="reader-status" data-role="status"></span>
+      <span class="reader-progress">
+        <span data-role="progress">0 / 0</span>
+        <span class="reader-preload" data-role="preload" title="Số câu đã tải trước">0 / 0</span>
+      </span>
       <button class="reader-btn reader-btn-ghost" data-role="settingsToggle" title="Cài đặt đọc">⚙</button>
     `;
 
@@ -642,6 +830,7 @@
     panel.className = 'reader-settings';
     panel.hidden = true;
     panel.innerHTML = `
+      <div class="msg err" data-role="errorBox" hidden></div>
       <label>Giọng đọc
         <select data-role="model">
           <option value="piper_vi">Piper VN</option>
@@ -679,8 +868,9 @@
     els = {
       playBtn: bar.querySelector('[data-role="play"]'),
       progress: bar.querySelector('[data-role="progress"]'),
-      status: bar.querySelector('[data-role="status"]'),
+      preload: bar.querySelector('[data-role="preload"]'),
       settingsToggle: bar.querySelector('[data-role="settingsToggle"]'),
+      errorBox: panel.querySelector('[data-role="errorBox"]'),
       panel,
       model: panel.querySelector('[data-role="model"]'),
       speed: panel.querySelector('[data-role="speed"]'),
@@ -731,8 +921,10 @@
     });
 
     els.playBtn.addEventListener('click', () => {
-      if (!active) start();
-      else if (!paused) pause();
+      if (!active) {
+        unlockAudioElement(); // must happen synchronously in this gesture — see unlockAudioElement()
+        start();
+      } else if (!paused) pause();
       else resume();
     });
 
@@ -770,13 +962,39 @@
   }
 
   async function bootstrap() {
+    const tBootstrap = performance.now();
+    console.log(
+      `reader.js: bootstrap() starting at ${tBootstrap.toFixed(0)}ms since navigation start ` +
+        `(document.readyState was "${document.readyState}")`
+    );
+    // Independent of chapter content (keyed by book id, not by what's in
+    // <article>) — fetched in parallel rather than after, same reasoning as
+    // meta.json + chapter content inside initChapterPage().
+    const progressPromise = fetchProgress();
     try {
       await initChapterPage();
     } catch (e) {
+      console.error('reader.js: initChapterPage() failed ::', (e && e.message) || e);
       document.querySelector('article').innerHTML = '<p>Lỗi tải nội dung chương. Thử tải lại trang.</p>';
     }
     buildControlBar();
+    if (bookId) applyResumeOrBaseline(await progressPromise);
+    console.log(
+      `reader.js: bootstrap() done — total ${(performance.now() - tBootstrap).toFixed(0)}ms, ` +
+        `${performance.now().toFixed(0)}ms since navigation start (chapter content + controls ready)`
+    );
   }
+
+  // Backgrounding the tab (switching apps, locking the screen) or closing it
+  // outright are the two "session might just end here" moments a reading
+  // page has that a native app's onDisappear/scenePhase covers for free —
+  // sync whatever the current position is so it isn't lost.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && bookId) postProgress(currentChapterNum, index, { beacon: true });
+  });
+  window.addEventListener('pagehide', () => {
+    if (bookId) postProgress(currentChapterNum, index, { beacon: true });
+  });
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', bootstrap);

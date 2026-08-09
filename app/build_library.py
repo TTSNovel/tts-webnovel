@@ -24,16 +24,20 @@ page — it's the same rendering path (book_renderer.py) used here.
 
 Usage: python3 app/build_library.py <epub_dir_or_file> [<epub_dir_or_file> ...] [-o site]
 """
+import io
 import json
 import shutil
 import sys
 from pathlib import Path
+
+from PIL import Image
 
 from book_renderer import (
     render_book_meta,
     render_book_page,
     render_chapter_fragment,
     render_chapter_shell,
+    render_chapter_titles,
     render_index_page,
 )
 from classify import classify
@@ -41,6 +45,26 @@ from epub_parser import extract_book, extract_book_from_mobi, extract_cover
 
 _LEGACY_EXTENSIONS = {".prc", ".mobi", ".azw3"}
 _JUNK_TITLE_MARKERS = ("created with", "written by", "gettextfromhtml")
+
+# Covers embedded in epubs are sized for full-screen e-reader display
+# (routinely 1000px+ on a side, hundreds of KB to ~1MB) — measured live on
+# the deployed home page: 10 book-grid thumbnails alone totaled 2.25MB,
+# with individual covers up to 809KB, for images shown at ~140px wide.
+# Re-encoding to a bounded size cuts that by an order of magnitude with no
+# visible quality loss at thumbnail size — this is the single biggest lever
+# on this site's page-load weight, well ahead of anything server/network-side.
+_COVER_MAX_DIM = 480
+_COVER_JPEG_QUALITY = 82
+
+
+def _resize_cover(cover_bytes: bytes) -> bytes:
+    with Image.open(io.BytesIO(cover_bytes)) as img:
+        img = img.convert("RGB")  # drop alpha/palette — JPEG has neither, and covers never need transparency
+        if max(img.size) > _COVER_MAX_DIM:
+            img.thumbnail((_COVER_MAX_DIM, _COVER_MAX_DIM), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=_COVER_JPEG_QUALITY, optimize=True)
+        return buf.getvalue()
 
 
 def _looks_like_real_title(title: str | None) -> bool:
@@ -103,7 +127,15 @@ def add_book_to_site(site_dir: Path, epub_path: Path, used_ids: set[int]) -> dic
         cover = extract_cover(str(epub_path))
         if cover is not None:
             cover_bytes, ext = cover
-            cover_name = f"cover.{ext}"
+            try:
+                cover_bytes = _resize_cover(cover_bytes)
+                cover_name = "cover.jpg"
+            except Exception as e:
+                # Some embedded cover images are corrupt/in a format PIL
+                # can't decode — fall back to the original bytes as-is
+                # rather than losing the cover entirely over this.
+                print(f"  WARN: cover resize failed ({e}), using original")
+                cover_name = f"cover.{ext}"
             (book_dir / cover_name).write_bytes(cover_bytes)
 
     for ch in chapters:
@@ -118,9 +150,10 @@ def add_book_to_site(site_dir: Path, epub_path: Path, used_ids: set[int]) -> dic
         encoding="utf-8",
     )
     (book_dir / "meta.json").write_text(
-        render_book_meta(title=book_title, author=author, category=category, n=len(chapters)),
+        render_book_meta(title=book_title, author=author, category=category, n=len(chapters), cover=cover_name),
         encoding="utf-8",
     )
+    (book_dir / "titles.json").write_text(render_chapter_titles(chapters), encoding="utf-8")
 
     return {
         "id": book_id, "title": book_title, "author": author, "category": category,

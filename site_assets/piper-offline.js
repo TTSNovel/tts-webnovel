@@ -169,8 +169,52 @@
     return new Blob(chunks);
   }
 
+  // The ONNX/phonemizer runtime files the inference Worker loads via
+  // importScripts()/locateFile() below — fixed, same for every user,
+  // unlike the model itself which is only fetched for people who opt into
+  // this voice. NOT part of download.js's always-on APP_SHELL_FILES
+  // precache (that runs unconditionally on every page load for every
+  // visitor, and these are ~39MB combined — dead weight for the majority
+  // who never touch Piper offline). Instead cached here, in the same
+  // "app-shell-v1" Cache Storage bucket download.js's service-worker
+  // fallback already reads from, at the exact moment the user explicitly
+  // asks to download offline TTS — one action, fully offline-ready after.
+  const APP_SHELL_CACHE = 'app-shell-v1'; // must match download.js's APP_SHELL_CACHE
+  const VENDOR_FILES = [
+    `${VENDOR_BASE}/ort.wasm.min.js`,
+    `${VENDOR_BASE}/ort-wasm-simd.wasm`,
+    `${VENDOR_BASE}/ort-wasm.wasm`,
+    `${VENDOR_BASE}/piper_phonemize.js`,
+    `${VENDOR_BASE}/piper_phonemize.wasm`,
+    `${VENDOR_BASE}/piper_phonemize.data`,
+  ];
+
+  async function vendorFilesCached() {
+    const cache = await caches.open(APP_SHELL_CACHE);
+    const hits = await Promise.all(VENDOR_FILES.map((url) => cache.match(url)));
+    return hits.every(Boolean);
+  }
+
+  async function cacheVendorFiles() {
+    const cache = await caches.open(APP_SHELL_CACHE);
+    await Promise.all(
+      VENDOR_FILES.map(async (url) => {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`fetch ${url} failed: ${resp.status}`);
+        await cache.put(url, resp);
+      })
+    );
+  }
+
+  // True only once BOTH the model (OPFS) and the vendor runtime files
+  // (Cache Storage) are present — either half missing means offline
+  // synthesis can't actually run. Checked (not just the model) so anyone
+  // who downloaded the model before this vendor-caching existed gets the
+  // missing half filled in the next time download() runs, without having
+  // to delete and re-fetch the 93MB model itself.
   async function isDownloaded() {
-    return !!(await opfsRead(MODEL_FILE));
+    const [modelReady, vendorReady] = await Promise.all([opfsRead(MODEL_FILE).then(Boolean), vendorFilesCached()]);
+    return modelReady && vendorReady;
   }
 
   // Single-flight, enforced HERE rather than trusted to callers — reader.js
@@ -185,19 +229,29 @@
   // places call download() or how they handle failure.
   let downloadPromise = null;
   async function download(onProgress) {
-    if (await isDownloaded()) return;
+    const [modelReady, vendorReady] = await Promise.all([opfsRead(MODEL_FILE).then(Boolean), vendorFilesCached()]);
+    if (modelReady && vendorReady) return;
     if (!downloadPromise) {
       downloadPromise = (async () => {
         try {
-          const [modelBlob, configBlob] = await Promise.all([
-            fetchBlobWithProgress(MODEL_URL, onProgress),
-            fetch(MODEL_CONFIG_URL).then((r) => {
-              if (!r.ok) throw new Error(`fetch model config failed: ${r.status}`);
-              return r.blob();
-            }),
-          ]);
-          await opfsWrite(MODEL_FILE, modelBlob);
-          await opfsWrite(CONFIG_FILE, configBlob);
+          const tasks = [];
+          if (!vendorReady) tasks.push(cacheVendorFiles());
+          if (!modelReady) {
+            tasks.push(
+              (async () => {
+                const [modelBlob, configBlob] = await Promise.all([
+                  fetchBlobWithProgress(MODEL_URL, onProgress),
+                  fetch(MODEL_CONFIG_URL).then((r) => {
+                    if (!r.ok) throw new Error(`fetch model config failed: ${r.status}`);
+                    return r.blob();
+                  }),
+                ]);
+                await opfsWrite(MODEL_FILE, modelBlob);
+                await opfsWrite(CONFIG_FILE, configBlob);
+              })()
+            );
+          }
+          await Promise.all(tasks);
         } finally {
           downloadPromise = null;
         }
@@ -208,6 +262,8 @@
 
   async function removeModel() {
     await opfsRemoveAll();
+    const cache = await caches.open(APP_SHELL_CACHE);
+    await Promise.all(VENDOR_FILES.map((url) => cache.delete(url)));
     recycleInferenceWorker();
   }
 
@@ -225,13 +281,16 @@
   //    does exactly that (guaranteed full reclaim); nothing short of it
   //    (session.release(), dropping references, etc.) reliably does on
   //    the WASM side. So the worker is deliberately terminated and
-  //    respawned every RECYCLE_AFTER_CALLS synthesize() calls — the
-  //    number is a conservative guess (OOM previously hit by sentence 5
-  //    running everything in one long-lived context), not a measured
-  //    threshold; tune it up if real-device testing shows it's overly
-  //    cautious. Model reload after a recycle is a local OPFS read, not a
-  //    network fetch, so the cost is real but bounded.
-  const RECYCLE_AFTER_CALLS = 5;
+  //    respawned every RECYCLE_AFTER_CALLS synthesize() calls. Was 5 —
+  //    still hit a live WASM crash ("Out of bounds memory access" from
+  //    _OrtReleaseTensor) on a real iPhone 13 mini (4GB RAM) with Timelines
+  //    showing JS-heap-alone climbing to ~800MB within ~20s and still
+  //    rising, so 5 calls wasn't a tight enough margin on this device.
+  //    Lowered to 3. Model reload after a recycle is a local OPFS read,
+  //    not a network fetch, so the cost of recycling more often is real
+  //    but bounded — tune back up only with real-device evidence it's
+  //    overly cautious, not just because it looks conservative on paper.
+  const RECYCLE_AFTER_CALLS = 3;
 
   // Absolute URLs throughout — inside a Worker created from a Blob URL
   // (blob:https://.../<uuid>), relative paths like "/assets/vendor/..."
@@ -264,10 +323,16 @@
     let modelConfig = null;
     async function ensureModelLoaded() {
       if (session && modelConfig) return;
+      const t0 = Date.now();
       const [modelFile, configFile] = await Promise.all([opfsRead(MODEL_FILE), opfsRead(CONFIG_FILE)]);
       if (!modelFile || !configFile) throw new Error('Model Piper offline chưa được tải.');
       modelConfig = JSON.parse(await configFile.text());
       session = await ort.InferenceSession.create(await modelFile.arrayBuffer());
+      // No hard data yet on how long this actually takes on a real device
+      // (OPFS read + ort.InferenceSession.create() parsing a ~93MB model) —
+      // logged here instead of guessed, so it shows up in Web Inspector's
+      // Console on the next real run instead of staying a guess.
+      console.warn('PiperOffline: ensureModelLoaded() took', Date.now() - t0, 'ms');
     }
 
     function phonemize(text, espeakVoice) {
@@ -315,9 +380,13 @@
     }
 
     self.onmessage = async (e) => {
-      const { id, text, speed } = e.data;
+      const { id, text, speed, warmUp } = e.data;
       try {
         await ensureModelLoaded();
+        if (warmUp) {
+          self.postMessage({ id, ok: true });
+          return;
+        }
         const phonemeIds = await phonemize(text.trim(), modelConfig.espeak.voice);
         const lengthScale = speed && speed !== 1.0 ? 1.0 / speed : modelConfig.inference.length_scale;
         const feeds = {
@@ -376,30 +445,72 @@
     return inferenceWorker;
   }
 
+  // reader.js's PRELOAD_AHEAD fires several synthesize() calls back to
+  // back (up to 6 at once) — they all land in the SAME worker, and its
+  // onmessage handler is async, so without this, a 2nd message's handler
+  // can start (and reach phonemize()/session.run()) before the 1st one's
+  // await chain finishes. The phonemizer/ONNX session's WASM state isn't
+  // built for that — this is almost certainly what caused the earlier
+  // "Out of bounds memory access" WASM crash (_OrtReleaseTensor) AND a
+  // synthesize() call that just never resolved (reader.js's new TTS
+  // timeout firing with nothing actually wrong on the reader.js side).
+  // Fix: never let a 2nd message reach the worker before the 1st one's
+  // response has come back, regardless of how many callers are queued up.
+  let queueTail = Promise.resolve();
+  function runSerialized(fn) {
+    const run = queueTail.then(fn, fn);
+    queueTail = run.then(() => {}, () => {}); // keep the chain alive even if `run` rejects
+    return run;
+  }
+
   // speed: same convention as tts-generate's synthesize() server-side
   // (main.py) — length_scale = 1/speed — so switching between online and
   // offline voices doesn't change how the "Tốc độ" setting behaves.
-  async function synthesize(text, speed) {
+  function synthesize(text, speed) {
+    return runSerialized(() => synthesizeOne(text, speed));
+  }
+
+  async function synthesizeOne(text, speed) {
     const worker = getInferenceWorker();
     const id = ++msgId;
     const result = await new Promise((resolve, reject) => {
       pending.set(id, { resolve, reject });
       worker.postMessage({ id, text, speed });
     });
-    // Recycle only checked AFTER a response comes back, and only acted on
-    // once nothing else is in flight — reader.js's PRELOAD_AHEAD fires
-    // several synthesize() calls back to back, and recycling mid-batch
-    // used to kill whichever of THOSE were still pending too (seen live:
-    // "Inference worker recycled mid-request" on sentence 2, which had
-    // done nothing wrong itself — it just happened to still be in flight
-    // when sentence 6 or so decided the count meant it was time to
-    // recycle).
     workerCallCount++;
-    if (workerCallCount >= RECYCLE_AFTER_CALLS && pending.size === 0) {
+    if (workerCallCount >= RECYCLE_AFTER_CALLS) {
       recycleInferenceWorker();
+      // Load the replacement worker's model right away instead of leaving
+      // it lazy — otherwise the model-load cost (see ensureModelLoaded()'s
+      // own timing log) lands on whichever sentence happens to be the
+      // first synthesize() call after this recycle. Goes through the same
+      // queue, so it still runs strictly after this call and strictly
+      // before the next queued synthesize() — never overlapping either.
+      // Best-effort: if it fails here, the next real synthesize() call
+      // still retries it (ensureModelLoaded() isn't skipped on failure).
+      runSerialized(() => warmUpOne()).catch(() => {});
     }
     return result;
   }
 
-  window.PiperOffline = { isDownloaded, download, removeModel, synthesize };
+  // Loads the model into whatever inference worker currently exists
+  // (spawning one if needed) without running phonemize/inference — used
+  // to pay the model-load cost ahead of a real ▶ press (see reader.js)
+  // instead of the user's first tap paying for it. Deliberately does NOT
+  // touch workerCallCount/recycle bookkeeping: it's not doing any
+  // inference, so it shouldn't count toward "time to recycle for memory".
+  function warmUp() {
+    return runSerialized(() => warmUpOne());
+  }
+
+  function warmUpOne() {
+    const worker = getInferenceWorker();
+    const id = ++msgId;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      worker.postMessage({ id, warmUp: true });
+    });
+  }
+
+  window.PiperOffline = { isDownloaded, download, removeModel, synthesize, warmUp };
 })();

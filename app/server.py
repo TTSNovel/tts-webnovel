@@ -16,7 +16,7 @@ import html
 import json
 import os
 import tempfile
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -59,7 +59,7 @@ _LOGIN_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Đăng nhập — Thư viện truyện</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {pwa_head}
 <style>
   :root {{ --bg:#fafafa; --surface:#fff; --text:#1a1a1a; --muted:#6b7280; --border:#e5e7eb; --accent:#4f46e5; --accent-text:#fff; }}
@@ -67,7 +67,8 @@ _LOGIN_PAGE = """<!doctype html>
     :root {{ --bg:#17181c; --surface:#1e1f24; --text:#e4e4e7; --muted:#9ca3af; --border:#2e2f36; --accent:#818cf8; --accent-text:#17181c; }}
   }}
   * {{ box-sizing: border-box; }}
-  body {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:var(--bg); color:var(--text); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }}
+  html {{ background:var(--bg); overscroll-behavior-y: none; }}
+  body {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:var(--bg); color:var(--text); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; overscroll-behavior-y: none; }}
   form {{ width: min(90vw, 320px); background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:2rem 1.5rem; }}
   h1 {{ font-size:1.2rem; margin:0 0 1.2rem; text-align:center; }}
   label {{ display:block; font-size:.85rem; color:var(--muted); margin-bottom:.3rem; }}
@@ -145,7 +146,7 @@ _IMPORT_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Thêm truyện — Thư viện truyện</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {pwa_head}
 <style>{css}</style>
 </head>
@@ -225,7 +226,7 @@ _DOWNLOAD_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Tải xuống — Thư viện truyện</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {pwa_head}
 <style>{css}</style>
 </head>
@@ -255,6 +256,49 @@ _DOWNLOAD_PAGE = """<!doctype html>
 @require_auth
 def download_page():
     return _DOWNLOAD_PAGE.format(pwa_head=_PWA_HEAD, css=_CSS)
+
+
+def _progress_path(site_dir):
+    return Path(site_dir) / "progress.json"
+
+
+def _load_progress(site_dir):
+    path = _progress_path(site_dir)
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def _save_progress(site_dir, data):
+    _progress_path(site_dir).write_text(json.dumps(data), encoding="utf-8")
+
+
+@app.route("/api/progress", methods=["GET"])
+@require_auth
+def progress_list():
+    return _load_progress(SITE_DIR)
+
+
+@app.route("/api/progress", methods=["POST"])
+@require_auth
+def progress_update():
+    body = request.get_json(force=True, silent=True) or {}
+    book_id = body.get("book_id")
+    chapter = body.get("chapter")
+    sentence = body.get("sentence")
+    if not isinstance(book_id, int) or not isinstance(chapter, int) or not isinstance(sentence, int):
+        abort(400)
+
+    data = _load_progress(SITE_DIR)
+    # Server stamps its own clock rather than trusting the client's — every
+    # timestamp compared during the app's last-write-wins merge (deciding
+    # which device's progress is newer) is then issued by the same clock.
+    record = {
+        "chapter": chapter,
+        "sentence": sentence,
+        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    data[str(book_id)] = record
+    _save_progress(SITE_DIR, data)
+    return record
 
 
 @app.route("/api/tts", methods=["POST"])
@@ -312,7 +356,16 @@ def static_files(path):
     is_public = path in _PUBLIC_ASSET_PATHS or path.startswith("assets/icons/")
     if not is_public and not session.get("authed"):
         return redirect(f"/login?next={request.path}")
-    return send_from_directory(SITE_DIR, path)
+    # sw.js and the app's own JS get no browser HTTP cache at all (not just
+    # a short max_age) — without this, Flask leaves Cache-Control unset and
+    # browsers fall back to their own heuristic caching, which has been
+    # letting phones keep serving an old cached reader.js/sw.js well after
+    # a new one was deployed (several "still buggy after fix" reports
+    # traced back to this, not the fix itself). max_age=0 forces a
+    # conditional revalidation (ETag/Last-Modified) on every request
+    # instead of trusting a local copy blindly.
+    max_age = 0 if path == "sw.js" or path.endswith(".js") else None
+    return send_from_directory(SITE_DIR, path, max_age=max_age)
 
 
 if __name__ == "__main__":
