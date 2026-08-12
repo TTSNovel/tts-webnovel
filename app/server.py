@@ -309,30 +309,35 @@ def _bug_reports_dir(site_dir):
 
 
 # iOS app's "Báo lỗi" (report bug) feature — sends a free-text description
-# plus (optionally) the app's own recent action/error timeline
-# (EventLogStore, tts-novel-ios repo) so a report already comes with the
-# context that led up to it, instead of a bare sentence. Each submission is
-# its own timestamped file rather than one growing list (unlike
-# progress.json) — reports are append-only and read individually, not
-# merged/queried, so there's no need to load/rewrite the whole set on every
-# submission.
+# (optional — the description can be left blank when the attached log is
+# the point of the report) plus (optionally) the app's own recent
+# action/error timeline (EventLogStore, tts-novel-ios repo; it's the only
+# logging the app does, so this already covers everything, not just user
+# actions) so a report already comes with the context that led up to it.
+# Each submission is its own timestamped file rather than one growing list
+# (unlike progress.json) — reports are append-only and read individually,
+# not merged/queried, so there's no need to load/rewrite the whole set on
+# every submission.
 @app.route("/api/bug-report", methods=["POST"])
 @require_auth
 def bug_report_submit():
     body = request.get_json(force=True, silent=True) or {}
     description = (body.get("description") or "").strip()
-    if not description:
+    events = body.get("events")
+    events = events[-2000:] if isinstance(events, list) else []
+    # Reject only a genuinely empty submission (no text AND no log) — the
+    # client already lets the description be blank on its own.
+    if not description and not events:
         abort(400)
 
-    events = body.get("events")
     record = {
         "description": description,
         "device": body.get("device", ""),
         "os_version": body.get("os_version", ""),
         "app_version": body.get("app_version", ""),
-        # Capped defensively server-side too, independent of whatever limit
+        # Capped defensively server-side too, independent of whatever cap
         # the client already applies before sending.
-        "events": events[-200:] if isinstance(events, list) else [],
+        "events": events,
         "submitted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     filename = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}.json"
