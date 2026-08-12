@@ -16,6 +16,7 @@ import html
 import json
 import os
 import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -299,6 +300,46 @@ def progress_update():
     data[str(book_id)] = record
     _save_progress(SITE_DIR, data)
     return record
+
+
+def _bug_reports_dir(site_dir):
+    d = Path(site_dir) / "bug_reports"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# iOS app's "Báo lỗi" (report bug) feature — sends a free-text description
+# plus (optionally) the app's own recent action/error timeline
+# (EventLogStore, tts-novel-ios repo) so a report already comes with the
+# context that led up to it, instead of a bare sentence. Each submission is
+# its own timestamped file rather than one growing list (unlike
+# progress.json) — reports are append-only and read individually, not
+# merged/queried, so there's no need to load/rewrite the whole set on every
+# submission.
+@app.route("/api/bug-report", methods=["POST"])
+@require_auth
+def bug_report_submit():
+    body = request.get_json(force=True, silent=True) or {}
+    description = (body.get("description") or "").strip()
+    if not description:
+        abort(400)
+
+    events = body.get("events")
+    record = {
+        "description": description,
+        "device": body.get("device", ""),
+        "os_version": body.get("os_version", ""),
+        "app_version": body.get("app_version", ""),
+        # Capped defensively server-side too, independent of whatever limit
+        # the client already applies before sending.
+        "events": events[-200:] if isinstance(events, list) else [],
+        "submitted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    filename = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}.json"
+    (_bug_reports_dir(SITE_DIR) / filename).write_text(
+        json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return {"ok": True}
 
 
 @app.route("/api/tts", methods=["POST"])
