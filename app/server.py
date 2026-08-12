@@ -397,9 +397,23 @@ def chapter_shell(book_id, chapter):
 _PUBLIC_ASSET_PATHS = {"manifest.json", "sw.js"}
 
 
+def _is_public_reading_path(path):
+    # Book catalog + covers + chapter content + per-book titles — the exact
+    # set the iOS app's APIClient reads (fetchBooks/fetchCoverData/
+    # fetchChapter/fetchChapterTitles). Deliberately public since the app's
+    # "chế độ khách" (guest mode) browses/reads without logging in first;
+    # everything else under this catch-all (and every other route in this
+    # file — /import, /api/tts, /api/progress, /api/bug-report) still
+    # requires the shared login, so a guest can read but can't burn TTS
+    # quota, push progress, or add books.
+    return path == "books.json" or path.startswith("books/")
+
+
 @app.route("/<path:path>")
 def static_files(path):
-    is_public = path in _PUBLIC_ASSET_PATHS or path.startswith("assets/icons/")
+    is_public = (
+        path in _PUBLIC_ASSET_PATHS or path.startswith("assets/icons/") or _is_public_reading_path(path)
+    )
     if not is_public and not session.get("authed"):
         return redirect(f"/login?next={request.path}")
     # sw.js and the app's own JS get no browser HTTP cache at all (not just
