@@ -104,7 +104,7 @@
   // button of its own.
   //
   // navigator.onLine is skipped as a signal elsewhere in this file
-  // (initHomePage's own comment explains why) because it's unreliable for
+  // (checkHomeOnline()'s own comment explains why) because it's unreliable for
   // deciding "is offline content available" — a false positive there
   // would wrongly skip showing content that's actually cached. Here the
   // stakes are the opposite: this is 9 fetches nobody is waiting on, and
@@ -390,58 +390,59 @@
     reflect();
   }
 
-  // Home page (server.py's "/", the PWA start_url): when there's genuinely
-  // no network, swap the (possibly stale, cached-by-precacheAppShell)
-  // catalog grid for the same downloaded-books list as the Download page
-  // — otherwise a fully offline app opens straight into a dead end. Uses
-  // a real fetch as the offline signal rather than navigator.onLine, which
-  // is unreliable — books.json is never itself cached, so this fetch only
-  // succeeds when the network is actually reachable.
+  // Home page (server.py's "/", the PWA start_url): routing between "show
+  // the Home page" and "show the offline Download page" is decided by
+  // exactly ONE real network call, made BEFORE anything else on the page
+  // gets a chance to fetch anything — see bootstrap() below, which awaits
+  // this ahead of precacheAppShell()'s 9 files and everything else. That
+  // ordering is the actual fix: this check used to run concurrently with
+  // that other traffic and would lose the race for bandwidth/connections
+  // under it, misreporting offline while the network was fine, just busy
+  // elsewhere. Going first, alone, means it never has to share.
   //
-  // navigator.onLine === false is still checked FIRST, as a short-circuit
-  // only (never treated as "definitely online"): real-device testing found
-  // that fetch()'s own timeout doesn't reliably bound this when the network
-  // interface is fully off (see sw.js's isBelievedOffline() for the same fix
-  // and the measured reason why) — skipping straight to the offline branch here
+  // A failure hard-navigates to the Download page instead of patching the
+  // Home page's markup in place — the Download page is already the real
+  // "read what's downloaded" experience (see render()), so offline Home and
+  // Download end up being the literal same page, not two lists to keep in
+  // sync.
+  //
+  // books.json is never itself cached, so this fetch only succeeds when the
+  // network is actually reachable — no separate probe endpoint needed.
+  // navigator.onLine === false is checked FIRST, as a short-circuit only
+  // (never treated as "definitely online"): real-device testing found that
+  // fetch()'s own timeout doesn't reliably bound this when the network
+  // interface is fully off (see sw.js's isBelievedOffline() for the same
+  // fix and the measured reason why) — skipping straight to "offline" here
   // avoids waiting on a fetch already known to be doomed.
-  //
-  // The grid's own <img class="cover"> tags are rendered with data-src,
-  // not src (see book_renderer.py's cover_html()) — SPECIFICALLY so the
-  // browser never fires all of them on its own the moment the HTML
-  // parses. Measured live on a real device: 30+ book covers all queued
-  // at once (most still "near" the viewport even with loading="lazy",
-  // which only defers off-screen ones) with no network available took
-  // ~4.5s of pure queueing before the page did anything else — every
-  // other part of the load was fast. This function only resolves them to
-  // real src once this SAME online check confirms the network is
-  // actually there; offline, the whole grid is replaced below anyway
-  // (with real covers for the much shorter downloaded-books list), so
-  // there's nothing to resolve — the deferred covers are simply discarded
-  // having never attempted a single network request.
-  function initHomePage() {
-    const wrap = document.getElementById('home-wrap');
-    if (!wrap) return;
-    const showOfflineGrid = () => {
-      const registry = loadRegistry();
-      const bookIds = Object.keys(registry);
-      wrap.innerHTML = bookIds.length
-        ? '<p class="dl-hint">Đang offline — chỉ hiện các truyện đã tải xuống.</p><div class="book-grid">' +
-          bookIds.map((bookId) => downloadedRowHtml(bookId, registry[bookId])).join('') +
-          '</div>'
-        : '<p class="dl-hint">Đang offline — chưa có truyện nào được tải xuống.</p>';
-    };
-    if (navigator.onLine === false) {
-      showOfflineGrid();
-      return;
+  async function checkHomeOnline() {
+    if (navigator.onLine === false) return false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+      await fetch('/books.json', { cache: 'no-store', signal: controller.signal });
+      return true;
+    } catch (e) {
+      return false;
+    } finally {
+      clearTimeout(timer);
     }
-    fetch('/books.json', { cache: 'no-store' })
-      .then(() => {
-        wrap.querySelectorAll('img.cover[data-src]').forEach((img) => {
-          img.src = img.dataset.src;
-          img.removeAttribute('data-src');
-        });
-      })
-      .catch(showOfflineGrid);
+  }
+
+  // The grid's own <img class="cover"> tags are rendered with data-src, not
+  // src (see book_renderer.py's cover_html()) — SPECIFICALLY so the browser
+  // never fires all of them on its own the moment the HTML parses, ahead of
+  // checkHomeOnline() above even running. Measured live on a real device:
+  // 30+ book covers all queued at once (most still "near" the viewport even
+  // with loading="lazy", which only defers off-screen ones) with no network
+  // available took ~4.5s of pure queueing before the page did anything else.
+  // Only ever called once checkHomeOnline() has already confirmed the
+  // network is there, so these never attempt a request that was going to
+  // fail anyway.
+  function revealHomeCovers(wrap) {
+    wrap.querySelectorAll('img.cover[data-src]').forEach((img) => {
+      img.src = img.dataset.src;
+      img.removeAttribute('data-src');
+    });
   }
 
   // Big, easy-to-hit "Xoá model Piper offline" card on the Download page —
@@ -476,17 +477,30 @@
     await refresh();
   }
 
-  function bootstrap() {
+  async function bootstrap() {
     console.log(
       `download.js: bootstrap() starting at ${performance.now().toFixed(0)}ms since navigation start ` +
         `(document.readyState was "${document.readyState}")`
     );
+
+    // Home page: the online/offline routing decision gates everything else
+    // below — see checkHomeOnline()'s comment for why it has to run alone,
+    // before precacheAppShell()'s own fetches or anything else starts.
+    const homeWrap = document.getElementById('home-wrap');
+    if (homeWrap) {
+      const online = await checkHomeOnline();
+      if (!online) {
+        window.location.replace('/download.html');
+        return; // navigating away — nothing else on this page matters now
+      }
+      revealHomeCovers(homeWrap);
+    }
+
     precacheAppShell(); // best-effort on every page load; each file fetch fails silently if offline
     if (document.getElementById('download-app')) render();
     initBookPage();
-    initHomePage();
     initPiperOfflinePage();
-    console.log(`download.js: bootstrap() synchronous part done at ${performance.now().toFixed(0)}ms`);
+    console.log(`download.js: bootstrap() init calls issued at ${performance.now().toFixed(0)}ms`);
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootstrap);
