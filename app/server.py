@@ -15,6 +15,7 @@ import hmac
 import html
 import json
 import os
+import re
 import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -396,6 +397,18 @@ def chapter_shell(book_id, chapter):
 # They're non-sensitive static assets, so that's fine to allow.
 _PUBLIC_ASSET_PATHS = {"manifest.json", "sw.js"}
 
+# A book's cover.<ext> is immutable once written (build_library.py re-encodes
+# it once at import time and never touches that path again) — safe to let
+# the browser skip revalidating it entirely instead of round-tripping an
+# ETag check on every repeat view. That round trip was measured live eating
+# a gunicorn worker/thread it didn't need to: a Home page with dozens of
+# already-seen covers fires them all at once, and each one waiting on a
+# free thread just to get told "304, unchanged" was crowding out the
+# requests that actually needed a worker (see sw.js's ONLINE_FETCH_TIMEOUT_MS
+# — a cover stuck behind that queue too long gets aborted client-side and
+# shows up broken, even though the network and server were both fine).
+_COVER_PATH_RE = re.compile(r"^books/\d+/cover\.[A-Za-z0-9]+$")
+
 
 def _is_public_reading_path(path):
     # Book catalog + covers + chapter content + per-book titles — the exact
@@ -425,7 +438,17 @@ def static_files(path):
     # conditional revalidation (ETag/Last-Modified) on every request
     # instead of trusting a local copy blindly.
     max_age = 0 if path == "sw.js" or path.endswith(".js") else None
-    return send_from_directory(SITE_DIR, path, max_age=max_age)
+    resp = send_from_directory(SITE_DIR, path, max_age=max_age)
+    if _COVER_PATH_RE.match(path):
+        # Flask's own no-max_age default (max_age=None above) stamps
+        # Cache-Control: no-cache — has to be cleared explicitly, or it
+        # forces revalidation on every request regardless of max-age/
+        # immutable below, defeating the whole point of this branch.
+        resp.cache_control.no_cache = False
+        resp.cache_control.max_age = 31536000
+        resp.cache_control.public = True
+        resp.cache_control.immutable = True
+    return resp
 
 
 if __name__ == "__main__":
