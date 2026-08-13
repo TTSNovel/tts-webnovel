@@ -401,8 +401,8 @@
   // navigator.onLine === false is still checked FIRST, as a short-circuit
   // only (never treated as "definitely online"): real-device testing found
   // that fetch()'s own timeout doesn't reliably bound this when the network
-  // interface is fully off (see sw.js's isOnline() for the same fix and the
-  // measured reason why) — skipping straight to the offline branch here
+  // interface is fully off (see sw.js's isBelievedOffline() for the same fix
+  // and the measured reason why) — skipping straight to the offline branch here
   // avoids waiting on a fetch already known to be doomed.
   //
   // The grid's own <img class="cover"> tags are rendered with data-src,

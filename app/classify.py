@@ -18,9 +18,10 @@ _CATEGORIES: list[tuple[str, list[str]]] = [
         "tu tien", "tu luyen", "dao ton", "tong mon", "linh khi", "kim dan",
         "nguyen anh", "hoa than", "phi thang", "tien dao", "huyen huyen",
         "ma phap", "phap su", "yeu nghiet", "than co nhan", "chan nhan",
+        "huyen ao", "vo hiep", "vo thuat", "giang ho", "kiem hiep", "vo dao",
     ]),
     ("Tận Thế - Sinh Tồn", [
-        "tan the", "sinh ton", "khung bo", "zombie", "di gioi", "phuc bam",
+        "tan the", "mat the", "sinh ton", "khung bo", "zombie", "di gioi", "phuc bam",
         "phu ban", "song lai", "dai tai", "diet vong", "hoang da", "du hoa",
     ]),
     ("Kinh Dị - Linh Dị", [
@@ -38,7 +39,7 @@ _CATEGORIES: list[tuple[str, list[str]]] = [
     ]),
     ("Lịch Sử - Xuyên Không", [
         "xuyen khong", "lich su", "trieu dai", "hoang de", "vuong gia",
-        "vuong tri", "phan phoi",
+        "vuong tri", "phan phoi", "cung dau", "da su", "trung sinh", "quan truong",
     ]),
 ]
 

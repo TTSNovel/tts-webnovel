@@ -356,6 +356,20 @@ def extract_cover(epub_path: str) -> tuple[bytes, str] | None:
     book = epub.read_epub(epub_path, options={"ignore_ncx": True})
     cover_item = next((i for i in book.get_items() if isinstance(i, epub.EpubCover)), None)
     if cover_item is None:
+        # EPUB3 marks the cover with manifest properties="cover-image", which
+        # ebooklib's reader turns straight into an EpubCover instance above.
+        # A lot of real-world (esp. Calibre/Sigil-produced) files are still
+        # EPUB2-style instead: a bare <meta name="cover" content="ITEM_ID"/>
+        # pointing at a plain image item that ebooklib never re-types — so
+        # the isinstance check above silently misses every one of them.
+        cover_id = next(
+            (o["content"] for _, o in book.get_metadata("http://www.idpf.org/2007/opf", "meta")
+             if o.get("name") == "cover" and o.get("content")),
+            None,
+        )
+        if cover_id is not None:
+            cover_item = book.get_item_with_id(cover_id)
+    if cover_item is None or not cover_item.media_type.startswith("image/"):
         return None
     ext = _COVER_EXTENSIONS.get(cover_item.media_type, "jpg")
     return cover_item.get_content(), ext
