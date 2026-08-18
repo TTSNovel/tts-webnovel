@@ -33,8 +33,14 @@ SITE_DIR = os.environ.get("SITE_DIR", os.path.join(os.path.dirname(__file__), ".
 WEB_AUTH_USER = os.environ["WEB_AUTH_USER"]
 WEB_AUTH_PASS = os.environ["WEB_AUTH_PASS"]
 TTS_API_URL = os.environ["TTS_API_URL"]
+GPU_TTS_API_URL = os.environ.get("GPU_TTS_API_URL", "")
 TTS_API_SECRET = os.environ["TTS_API_SECRET"]
 DEFAULT_TTS_MODEL = os.environ.get("DEFAULT_TTS_MODEL", "piper_vi")
+
+# Models served by tts-gpu (see tts-pipeline-infra/src/tts-gpu) instead of
+# tts-generate — a separate Cloud Run service since GPU attachment forces
+# GPU billing/sizing onto the whole service it's on.
+GPU_TTS_MODELS = {"gwen_tts"}
 
 app = Flask(__name__)
 app.secret_key = os.environ["SESSION_SECRET"]
@@ -355,16 +361,29 @@ def tts_proxy():
     text = body.get("text", "")
     if not text:
         abort(400)
+    model = body.get("model") or DEFAULT_TTS_MODEL
     payload = {
         "text": text,
         "speed": body.get("speed", 1.0),
-        "model": body.get("model") or DEFAULT_TTS_MODEL,
+        "model": model,
     }
+    if model in GPU_TTS_MODELS:
+        target_url = GPU_TTS_API_URL
+        if body.get("speaker"):
+            payload["speaker"] = body["speaker"]
+        # gwen-tts's autoregressive decoding measured ~0.4-0.5s/char with
+        # no flash-attn (sdpa fallback) on an L4 — a full 150-char chunk
+        # (reader.js's MAX_TTS_CHARS) plus a cold model load can approach
+        # 90-100s, well past the 60s budget that's fine for Piper/Google.
+        proxy_timeout = 180
+    else:
+        target_url = TTS_API_URL
+        proxy_timeout = 60
     upstream = requests.post(
-        f"{TTS_API_URL}/tts/generate",
+        f"{target_url}/tts/generate",
         json=payload,
         headers={"x-tts-secret": TTS_API_SECRET},
-        timeout=60,
+        timeout=proxy_timeout,
     )
     return Response(
         upstream.content, status=upstream.status_code, content_type=upstream.headers.get("Content-Type", "audio/wav")

@@ -45,6 +45,21 @@
   const MAX_TTS_CHARS = 150;
   const PRELOAD_AHEAD = 6;
 
+  // Built-in gwen_tts reference speakers (see tts-pipeline-infra's
+  // src/tts-gpu/gwen_data/ref_info.json) — static list, hardcoded here
+  // rather than fetched, since it only changes when that image is rebuilt.
+  const GWEN_SPEAKERS = [
+    ['yen_nhi', 'Yến Nhi'],
+    ['my_van', 'Mỹ Vân'],
+    ['ai_vy', 'Ái Vy'],
+    ['an_nhi', 'An Nhi'],
+    ['dieu_linh', 'Diệu Linh'],
+    ['khanh_toan', 'Khánh Toàn'],
+    ['tran_lam', 'Trần Lâm'],
+    ['nsnd_ha_phuong', 'NSND Hà Phương'],
+    ['nsnd_kim_cuc', 'NSND Kim Cúc'],
+  ];
+
   let sentences = [];
   let index = 0;
   let active = false;
@@ -276,7 +291,11 @@
   async function fetchAudioUrl(text) {
     const speed = parseFloat(localStorage.getItem('reader.speed') || '1.0');
     const model = localStorage.getItem('reader.model') || '';
-    return withTimeout(fetchAudioUrlUnbounded(text, model, speed), TTS_TIMEOUT_MS);
+    // gwen_tts's autoregressive generation runs 20-90s even warm (measured
+    // on its Cloud Run GPU service) — far past the 20s default that's
+    // plenty for the other (near-instant) backends.
+    const timeoutMs = model === 'gwen_tts' ? 200000 : TTS_TIMEOUT_MS;
+    return withTimeout(fetchAudioUrlUnbounded(text, model, speed), timeoutMs);
   }
 
   async function fetchAudioUrlUnbounded(text, model, speed) {
@@ -286,10 +305,15 @@
       return URL.createObjectURL(blob);
     }
 
+    const body = { text: cleanTextForTTS(text), speed, model: model || undefined };
+    if (model === 'gwen_tts') {
+      body.speaker = localStorage.getItem('reader.gwenSpeaker') || GWEN_SPEAKERS[0][0];
+    }
+
     const response = await fetch('/api/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: cleanTextForTTS(text), speed, model: model || undefined }),
+      body: JSON.stringify(body),
     });
     if (!response.ok) throw new Error(`TTS error: ${response.status}`);
     return URL.createObjectURL(await response.blob());
@@ -730,6 +754,15 @@
     navigator.mediaSession.setActionHandler('previoustrack', () => jumpToChapterNum(currentChapterNum - 1));
   }
 
+  // Shows/hides the built-in-speaker picker depending on whether gwen_tts
+  // is the selected voice — no download/warm-up step needed here (unlike
+  // Piper offline below), the speaker is just an extra field on the
+  // regular /api/tts POST body.
+  function refreshGwenSpeakerBox() {
+    if (!els) return;
+    els.gwenSpeakerBox.hidden = els.model.value !== 'gwen_tts';
+  }
+
   // Shows/hides the model box in the settings panel depending on whether
   // "Piper (offline)" is the selected voice, and just reflects state —
   // selecting the voice does NOT itself download anything. The actual
@@ -836,6 +869,7 @@
           <option value="piper_vi">Piper VN</option>
           <option value="google_tts">Google Cloud TTS</option>
           <option value="vieneu">VieNeu-TTS</option>
+          <option value="gwen_tts">Gwen-TTS (voice clone)</option>
           <option value="piper_offline">Piper (offline)</option>
         </select>
       </label>
@@ -844,6 +878,11 @@
         <button type="button" class="dl-btn" data-role="piperOfflineBtn"></button>
         <div class="dl-progress" data-role="piperOfflineProgress" hidden><div class="dl-progress-bar"></div></div>
       </div>
+      <label data-role="gwenSpeakerBox" hidden>Giọng Gwen-TTS
+        <select data-role="gwenSpeaker">
+          ${GWEN_SPEAKERS.map(([key, name]) => `<option value="${key}">${name}</option>`).join('')}
+        </select>
+      </label>
       <label>Tốc độ
         <select data-role="speed">
           <option value="0.85">0.85x</option>
@@ -880,6 +919,8 @@
       piperOfflineStatus: panel.querySelector('[data-role="piperOfflineStatus"]'),
       piperOfflineBtn: panel.querySelector('[data-role="piperOfflineBtn"]'),
       piperOfflineProgress: panel.querySelector('[data-role="piperOfflineProgress"]'),
+      gwenSpeakerBox: panel.querySelector('[data-role="gwenSpeakerBox"]'),
+      gwenSpeaker: panel.querySelector('[data-role="gwenSpeaker"]'),
     };
 
     els.model.value = localStorage.getItem('reader.model') || 'piper_vi';
@@ -890,8 +931,16 @@
       // instead of finishing the current chapter in a mixed voice.
       dropPreloadedAudio();
       refreshPiperOfflineBox();
+      refreshGwenSpeakerBox();
     });
     refreshPiperOfflineBox();
+    refreshGwenSpeakerBox();
+
+    els.gwenSpeaker.value = localStorage.getItem('reader.gwenSpeaker') || GWEN_SPEAKERS[0][0];
+    els.gwenSpeaker.addEventListener('change', () => {
+      localStorage.setItem('reader.gwenSpeaker', els.gwenSpeaker.value);
+      dropPreloadedAudio();
+    });
 
     els.speed.value = localStorage.getItem('reader.speed') || '1';
     els.speed.addEventListener('change', () => {
