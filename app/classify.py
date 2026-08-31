@@ -12,38 +12,50 @@ from __future__ import annotations
 import re
 import unicodedata
 
-# (category, [keywords]) — checked in order, first match wins.
+# (category, [keywords]) — checked in order, first match wins. Category
+# labels are English (see build_library.py's _CATEGORY_RENAME_MAP for the
+# migration that moved existing books off the old Vietnamese labels) even
+# though the keywords themselves stay Vietnamese-Latin (title/description
+# text this matches against is Vietnamese with diacritics stripped) —
+# except the LitRPG bucket, whose source material is English to begin with.
 _CATEGORIES: list[tuple[str, list[str]]] = [
-    ("Tu Tiên - Huyền Huyễn", [
+    # Checked before Cultivation - Fantasy: English progression-fantasy terms
+    # (this library's source text for these is English, e.g. "Defiance of
+    # the Fall: A LitRPG Adventure") would never hit any of the
+    # diacritic-stripped Vietnamese keywords below on their own.
+    ("LitRPG - Progression Fantasy", [
+        "litrpg", "system interface", "skill tree", "dungeon core", "class evolution",
+    ]),
+    ("Cultivation - Fantasy", [
         "tu tien", "tu luyen", "dao ton", "tong mon", "linh khi", "kim dan",
         "nguyen anh", "hoa than", "phi thang", "tien dao", "huyen huyen",
         "ma phap", "phap su", "yeu nghiet", "than co nhan", "chan nhan",
         "huyen ao", "vo hiep", "vo thuat", "giang ho", "kiem hiep", "vo dao",
     ]),
-    ("Tận Thế - Sinh Tồn", [
+    ("Apocalypse - Survival", [
         "tan the", "mat the", "sinh ton", "khung bo", "zombie", "di gioi", "phuc bam",
         "phu ban", "song lai", "dai tai", "diet vong", "hoang da", "du hoa",
     ]),
-    ("Kinh Dị - Linh Dị", [
+    ("Horror - Supernatural", [
         "kinh di", "linh di", "ma quy", "hanh gia", "quy bi", "am hon",
         "chet", "ta ac",
     ]),
-    ("Đô Thị - Dị Năng", [
+    ("Urban - Superpowers", [
         "do thi", "di nang", "sieu nang luc", "hien dai", "thanh pho",
     ]),
-    ("Khoa Huyễn - Cơ Giáp", [
+    ("Sci-Fi - Mecha", [
         "khoa huyen", "co giap", "vu tru", "robot", "tri tue nhan tao", "hanh tinh",
     ]),
-    ("Ngôn Tình - Sủng", [
+    ("Romance", [
         "ngon tinh", "sung", "yeu duong", "chuong mon", "my nu", "phu quan",
     ]),
-    ("Lịch Sử - Xuyên Không", [
+    ("Historical - Time Travel", [
         "xuyen khong", "lich su", "trieu dai", "hoang de", "vuong gia",
         "vuong tri", "phan phoi", "cung dau", "da su", "trung sinh", "quan truong",
     ]),
 ]
 
-_DEFAULT_CATEGORY = "Khác"
+_DEFAULT_CATEGORY = "Other"
 
 
 def _strip_diacritics(text: str) -> str:
