@@ -261,8 +261,15 @@ def write_index(site_dir: Path, manifest: list[dict]) -> None:
     books_by_category: dict[str, list[dict]] = {}
     for entry in manifest:
         books_by_category.setdefault(entry["category"], []).append(entry)
-    (site_dir / "index.html").write_text(render_index_page(books_by_category), encoding="utf-8")
+    # A fresh timestamp on every write_index() call (bulk build AND live
+    # /import both go through this one function) — version-check.js polls
+    # this and reloads the home page when it changes, so a client sees a
+    # newly-imported book without needing a manual hard-refresh to bust
+    # whatever cache is sitting between it and index.html.
+    version = str(int(time.time()))
+    (site_dir / "index.html").write_text(render_index_page(books_by_category, version=version), encoding="utf-8")
     (site_dir / "books.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    (site_dir / "version.json").write_text(json.dumps({"v": version}), encoding="utf-8")
 
 
 def build_library(inputs: list[str], output_dir: str) -> None:
@@ -274,6 +281,7 @@ def build_library(inputs: list[str], output_dir: str) -> None:
     shutil.copy(site_assets / "reader.js", assets_dir / "reader.js")
     shutil.copy(site_assets / "download.js", assets_dir / "download.js")
     shutil.copy(site_assets / "piper-offline.js", assets_dir / "piper-offline.js")
+    shutil.copy(site_assets / "version-check.js", assets_dir / "version-check.js")
     shutil.copy(site_assets / "manifest.json", out / "manifest.json")
     shutil.copy(site_assets / "sw.js", out / "sw.js")
     shutil.copytree(site_assets / "icons", assets_dir / "icons", dirs_exist_ok=True)

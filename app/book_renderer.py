@@ -431,6 +431,7 @@ _INDEX_PAGE = """<!doctype html>
 <meta charset="utf-8">
 <title>Thư viện truyện</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="site-version" content="{version}">
 {pwa_head}
 <style>{css}</style>
 </head>
@@ -457,6 +458,7 @@ _INDEX_PAGE = """<!doctype html>
 </div>
 <script src="/assets/download.js"></script>
 <script src="/assets/progress.js"></script>
+<script src="/assets/version-check.js"></script>
 </body>
 </html>
 """
@@ -528,7 +530,7 @@ def render_book_page(
     )
 
 
-def render_index_page(books_by_category: dict[str, list[dict]]) -> str:
+def render_index_page(books_by_category: dict[str, list[dict]], version: str = "") -> str:
     category_blocks = []
     for category in sorted(books_by_category):
         books = sorted(books_by_category[category], key=lambda b: b["title"])
@@ -548,4 +550,4 @@ def render_index_page(books_by_category: dict[str, list[dict]]) -> str:
             f'  <section class="category">\n    <h2>{html.escape(category)}</h2>\n'
             f'    <div class="book-grid">\n' + "\n".join(cards) + "\n    </div>\n  </section>"
         )
-    return _INDEX_PAGE.format(css=_CSS, pwa_head=_PWA_HEAD, categories="\n".join(category_blocks))
+    return _INDEX_PAGE.format(css=_CSS, pwa_head=_PWA_HEAD, categories="\n".join(category_blocks), version=version)
