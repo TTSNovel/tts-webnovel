@@ -26,6 +26,7 @@ Usage: python3 app/build_library.py <epub_dir_or_file> [<epub_dir_or_file> ...] 
 """
 import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -272,6 +273,18 @@ def write_index(site_dir: Path, manifest: list[dict]) -> None:
     (site_dir / "version.json").write_text(json.dumps({"v": version}), encoding="utf-8")
 
 
+def _write_piper_offline_js(site_assets: Path, assets_dir: Path) -> None:
+    """Copies piper-offline.js, substituting its GCS model base URL from
+    PIPER_MODEL_BASE_URL — the bucket is a personal GCP resource, not
+    committed as a literal in site_assets/ (see piper-offline.js)."""
+    base_url = os.environ.get("PIPER_MODEL_BASE_URL", "")
+    if not base_url:
+        print("WARNING: PIPER_MODEL_BASE_URL not set — Piper offline voice download will not work", file=sys.stderr)
+    content = (site_assets / "piper-offline.js").read_text(encoding="utf-8")
+    content = content.replace("__PIPER_MODEL_BASE_URL__", base_url)
+    (assets_dir / "piper-offline.js").write_text(content, encoding="utf-8")
+
+
 def build_library(inputs: list[str], output_dir: str) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -280,7 +293,7 @@ def build_library(inputs: list[str], output_dir: str) -> None:
     site_assets = Path(__file__).resolve().parent.parent / "site_assets"
     shutil.copy(site_assets / "reader.js", assets_dir / "reader.js")
     shutil.copy(site_assets / "download.js", assets_dir / "download.js")
-    shutil.copy(site_assets / "piper-offline.js", assets_dir / "piper-offline.js")
+    _write_piper_offline_js(site_assets, assets_dir)
     shutil.copy(site_assets / "version-check.js", assets_dir / "version-check.js")
     shutil.copy(site_assets / "manifest.json", out / "manifest.json")
     shutil.copy(site_assets / "sw.js", out / "sw.js")

@@ -34,8 +34,11 @@
   // MIT-licensed voice model (same one tts-generate uses server-side), so
   // serving it unauthenticated costs nothing in privacy — unlike the
   // book content, which stays behind login via novel-web's own bucket.
-  const MODEL_URL = 'https://storage.googleapis.com/tts-pipeline-yl-piper-offline/vi_VN-vais1000-medium.onnx';
-  const MODEL_CONFIG_URL = 'https://storage.googleapis.com/tts-pipeline-yl-piper-offline/vi_VN-vais1000-medium.onnx.json';
+  // Substituted at build time (see build_library.py) from PIPER_MODEL_BASE_URL —
+  // not committed here, personal GCS bucket.
+  const MODEL_BASE_URL = '__PIPER_MODEL_BASE_URL__';
+  const MODEL_URL = `${MODEL_BASE_URL}/vi_VN-vais1000-medium.onnx`;
+  const MODEL_CONFIG_URL = `${MODEL_BASE_URL}/vi_VN-vais1000-medium.onnx.json`;
   const OPFS_DIR = 'piper-offline';
   const MODEL_FILE = 'model.onnx';
   const CONFIG_FILE = 'model.onnx.json';
