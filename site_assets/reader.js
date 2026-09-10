@@ -100,6 +100,17 @@
     return String(n).padStart(4, '0');
   }
 
+  // Reflects the saved font-size choice onto <html> as a CSS variable (see
+  // book_renderer.py's --reader-font-scale) rather than restyling <article>
+  // directly — this way it's set once and survives every later
+  // article.innerHTML replacement (chapter nav, auto-advance) with no
+  // per-navigation reapplication needed. Called immediately at script
+  // evaluation (not just from the settings panel) so the very first
+  // chapter paints at the saved size instead of a flash of the default.
+  function applyFontScale() {
+    document.documentElement.style.setProperty('--reader-font-scale', localStorage.getItem('reader.fontSize') || '1');
+  }
+
   // Reading-history sync — GET once per page load (in parallel with the
   // chapter fetch, see bootstrap()), POST at milestones (pause, chapter
   // navigation, tab hidden, tab close) rather than every sentence. Same
@@ -892,6 +903,15 @@
           <option value="1.5">1.5x</option>
         </select>
       </label>
+      <label>Cỡ chữ
+        <select data-role="fontSize">
+          <option value="0.85">Nhỏ</option>
+          <option value="1">Vừa</option>
+          <option value="1.15">Lớn</option>
+          <option value="1.3">Rất lớn</option>
+          <option value="1.5">Cực lớn</option>
+        </select>
+      </label>
       <label class="reader-settings-checkbox">
         <input type="checkbox" data-role="autoNext">
         Tự động sang chương tiếp khi đọc xong
@@ -913,6 +933,7 @@
       panel,
       model: panel.querySelector('[data-role="model"]'),
       speed: panel.querySelector('[data-role="speed"]'),
+      fontSize: panel.querySelector('[data-role="fontSize"]'),
       autoNext: panel.querySelector('[data-role="autoNext"]'),
       autoStopMinutes: panel.querySelector('[data-role="autoStopMinutes"]'),
       piperOfflineBox: panel.querySelector('[data-role="piperOfflineBox"]'),
@@ -946,6 +967,12 @@
     els.speed.addEventListener('change', () => {
       localStorage.setItem('reader.speed', els.speed.value);
       dropPreloadedAudio();
+    });
+
+    els.fontSize.value = localStorage.getItem('reader.fontSize') || '1';
+    els.fontSize.addEventListener('change', () => {
+      localStorage.setItem('reader.fontSize', els.fontSize.value);
+      applyFontScale();
     });
 
     els.autoNext.checked = localStorage.getItem('reader.autoNext') === '1';
@@ -1004,6 +1031,16 @@
 
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && active) manualStop();
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        // Don't hijack the arrow keys while they're being used to operate a
+        // form control in the settings panel (the voice/speed/font-size
+        // <select>s, the auto-stop-minutes <input>) — only treat them as
+        // the chapter-nav hotkey when nothing in the panel has focus.
+        const tag = e.target && e.target.tagName;
+        if (tag === 'SELECT' || tag === 'INPUT' || tag === 'TEXTAREA') return;
+        e.preventDefault();
+        jumpToChapterNum(currentChapterNum + (e.key === 'ArrowRight' ? 1 : -1));
+      }
     });
 
     setupChapterNavInterception();
@@ -1044,6 +1081,8 @@
   window.addEventListener('pagehide', () => {
     if (bookId) postProgress(currentChapterNum, index, { beacon: true });
   });
+
+  applyFontScale();
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', bootstrap);

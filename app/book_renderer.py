@@ -110,7 +110,11 @@ a { color: inherit; text-decoration: none; }
   background: var(--surface); border-bottom: 1px solid var(--border);
 }
 .wrap { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 6rem; }
-.wrap.narrow { max-width: 720px; }
+/* Chapter reading column — deliberately wider than a typical ~65ch prose
+   column: at 720px, wide desktop viewports were mostly empty side margin
+   with very little actual text on screen per scroll, worse than it needs
+   to be for a page whose only job is displaying reading content. */
+.wrap.narrow { max-width: 920px; }
 
 /* home page */
 .site-topbar {
@@ -139,10 +143,18 @@ a { color: inherit; text-decoration: none; }
   font-size: 1.05rem; margin: 0 0 1rem; padding-left: .6rem;
   border-left: 4px solid var(--accent);
 }
-.book-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 1.1rem; }
+/* align-items:start overrides Grid's default "stretch" — without it, every
+   .book-card is force-stretched to match its row's tallest sibling, which
+   then squeezes the flex-column children back down via implicit
+   flex-shrink (measured live: a fixed 2.7em title collapsing to ~29px)
+   fighting the very fixed-height rules below that are supposed to keep
+   cards aligned. Cards don't need equal height to line up — only the
+   fixed-height title/author boxes below do that — so nothing is lost by
+   letting each card just be its own natural height. */
+.book-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 1.1rem; align-items: start; }
 .book-card { display: flex; flex-direction: column; gap: .4rem; }
 .book-card .cover {
-  aspect-ratio: 2 / 3; border-radius: 10px; display: flex; align-items: center; justify-content: center;
+  width: 100%; aspect-ratio: 2 / 3; border-radius: 10px; display: flex; align-items: center; justify-content: center;
   color: #fff; font-size: 2.4rem; font-weight: 700; text-shadow: 0 2px 6px rgba(0,0,0,.25);
   box-shadow: 0 2px 10px rgba(0,0,0,.18); transition: transform .15s ease;
 }
@@ -151,8 +163,30 @@ a { color: inherit; text-decoration: none; }
    just makes it fill that box (placeholder divs size via flex+aspect-ratio
    alone, but a replaced element like <img> needs an explicit width/fit). */
 img.cover { width: 100%; height: 100%; object-fit: cover; display: block; }
-.book-card .title { font-weight: 600; font-size: .9rem; line-height: 1.35; }
-.book-card .author { color: var(--muted); font-size: .78rem; }
+/* Reserved to exactly 2 lines regardless of actual title length — a grid
+   row's cards don't line up (cover/author/chapter-count all landing at
+   different heights per card) when the title above them takes 1 line on
+   one card and 2-3 on its neighbor; a fixed height keeps every card's
+   title box the same regardless, so everything below it starts at the
+   same y consistently across a row. Deliberately plain height+overflow
+   rather than -webkit-line-clamp (which would also add a "…" on overflow)
+   — line-clamp needs the legacy -webkit-box display mode, and Blink
+   miscalculates that box's height once it's nested inside this grid
+   (measured live: collapses to ~29px instead of the requested 2-line
+   ~39px), a known bad interaction between the legacy flexbox model and
+   Grid's intrinsic-sizing pass. Losing the ellipsis on very long titles
+   (rare — most fit in 2 lines) is a small trade for correct, reliable
+   alignment everywhere else. */
+.book-card .title {
+  font-weight: 600; font-size: .9rem; line-height: 1.35; height: 2.7em; overflow: hidden;
+}
+/* Single line, ellipsized rather than wrapping — same alignment reasoning
+   as .title above, and always rendered (see render_index_page) even for
+   authorless books so its absence doesn't shift .meta up on those cards. */
+.book-card .author {
+  color: var(--muted); font-size: .78rem; line-height: 1.3; height: 1.3em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .book-card .meta { color: var(--muted); font-size: .75rem; }
 .book-card[hidden] { display: none; }
 /* Filled in client-side by progress.js (GET /api/progress) — the card
@@ -185,8 +219,14 @@ img.cover { width: 100%; height: 100%; object-fit: cover; display: block; }
 .chapter-list .title { flex: 1; }
 
 /* chapter page */
-article h1 { font-size: 1.4rem; margin: 0 0 1.5rem; }
-article p { margin: 0 0 1.1em; font-size: 1.05rem; }
+/* Reading font size is user-adjustable (reader.js's settings panel writes
+   --reader-font-scale onto <html>) — h1/p sizes are expressed in em off of
+   article's own font-size (the scale's one unit) so the default (scale=1,
+   article font-size == 1rem) renders pixel-identical to the old plain-rem
+   values, while every other multiplier scales both consistently. */
+article { font-size: calc(1rem * var(--reader-font-scale, 1)); }
+article h1 { font-size: 1.4em; margin: 0 0 1.5rem; }
+article p { margin: 0 0 1.1em; font-size: 1.05em; }
 [data-r-s].reading { background-color: rgba(255, 220, 50, 0.6); border-radius: 3px; outline: 2px solid rgba(255, 180, 0, 0.65); outline-offset: 1px; }
 
 /* Small round icon button — the topbar's "‹ Mục lục" menu link. */
@@ -232,13 +272,16 @@ article p { margin: 0 0 1.1em; font-size: 1.05rem; }
 
 /* reader control bar — kept deliberately minimal: play, progress, settings
    only. Chapter/menu nav lives in the topbar row + below the article, not
-   here. Fixed width so it stays centered via left:50% + translateX(-50%)
-   without visibly shifting/jumping left-right if its content ever changes. */
+   here. Pinned to the right edge, vertically centered, column-stacked
+   (rather than the old bottom-center horizontal pill) — out of the way of
+   the reading column's own bottom-of-page controls (chapter-nav-bottom)
+   and closer to a thumb's natural resting position when a phone is held
+   one-handed. Width isn't fixed here since a column stack's width is just
+   its widest child (.reader-progress, below) regardless of content changes. */
 .reader-bar {
-  position: fixed; left: 50%; transform: translateX(-50%);
-  bottom: calc(1rem + env(safe-area-inset-bottom));
-  display: flex; align-items: center; gap: .5rem; padding: .5rem .75rem;
-  width: min(70vw, 200px);
+  position: fixed; top: 50%; transform: translateY(-50%);
+  right: calc(.75rem + env(safe-area-inset-right));
+  display: flex; flex-direction: column; align-items: center; gap: .5rem; padding: .75rem .4rem;
   background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
   box-shadow: 0 4px 16px rgba(0,0,0,.15); z-index: 20;
 }
@@ -248,18 +291,36 @@ article p { margin: 0 0 1.1em; font-size: 1.05rem; }
   display: inline-flex; align-items: center; justify-content: center;
 }
 .reader-btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); font-size: 1.1rem; }
+/* Narrower than the old horizontal layout's 4.5rem — that width had to fit
+   next to the play/settings buttons in a single row, but stacked in a
+   column here it just made the whole pill wider than it needs to be for
+   two short lines of digits. Long numbers (e.g. "1234 / 5678") simply wrap
+   to a second line instead of stretching the column back out. */
 .reader-progress {
   display: flex; flex-direction: column; align-items: center; line-height: 1.25;
-  font-size: .85rem; color: var(--muted); width: 4.5rem; flex: none; text-align: center;
+  font-size: .85rem; color: var(--muted); width: 3.4rem; flex: none; text-align: center;
 }
 .reader-preload { font-size: .68rem; opacity: .75; }
 
+/* Opens to the left of .reader-bar, anchored from the same edge (right) as
+   the bar itself — anchoring from "right" here AND "left" elsewhere (an
+   earlier version of this rule) put the panel outside the CSS spec's
+   left+right+max-width sizing rules: once max-width clamped the computed
+   width, the box kept its "left" offset and dropped "right" entirely (LTR
+   over-constrained resolution), snapping the panel to the far-left edge of
+   the viewport regardless of where the toggle button actually was — on a
+   wide screen that put a button on the right and its panel all the way on
+   the left, looking like two unrelated floating elements. width: min(...)
+   with only "right" set avoids that: the box's left edge is just wherever
+   width happens to end, so it always sits right next to the button. */
 .reader-settings {
-  position: fixed; left: 50%; transform: translateX(-50%);
-  bottom: calc(4.5rem + env(safe-area-inset-bottom));
-  display: flex; flex-direction: column; gap: .7rem; width: min(90vw, 320px);
+  position: fixed; top: 50%; transform: translateY(-50%);
+  right: calc(7rem + env(safe-area-inset-right));
+  width: min(320px, calc(100vw - 8rem));
+  display: flex; flex-direction: column; gap: .7rem;
   padding: 1rem 1.1rem; background: var(--surface); border: 1px solid var(--border);
   border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.15); z-index: 20;
+  max-height: calc(100vh - 2rem); overflow-y: auto;
 }
 .reader-settings[hidden] { display: none; }
 .reader-settings label { display: flex; flex-direction: column; gap: .3rem; font-size: .8rem; color: var(--muted); }
@@ -536,7 +597,11 @@ def render_index_page(books_by_category: dict[str, list[dict]], version: str = "
         books = sorted(books_by_category[category], key=lambda b: b["title"])
         cards = []
         for b in books:
-            author_html = f'<span class="author">{html.escape(b["author"])}</span>' if b.get("author") else ""
+            # Always emit the .author span, even blank — its CSS reserves a
+            # fixed one-line height (see book-card .author), so an authorless
+            # book doesn't pull .meta up a line and throw off row alignment
+            # against its siblings that do have one.
+            author_html = f'<span class="author">{html.escape(b["author"])}</span>' if b.get("author") else '<span class="author"></span>'
             cover_url = f'books/{b["id"]}/{b["cover"]}' if b.get("cover") else None
             cards.append(_BOOK_CARD.format(
                 id=b["id"],

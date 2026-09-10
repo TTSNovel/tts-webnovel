@@ -38,6 +38,8 @@
     style.textContent = `
       .progress-badge { display: block; margin-top: .1rem; font-size: .72rem; color: var(--accent); font-weight: 600; }
       .book-reading-actions { display: flex; gap: .5rem; margin-top: 1rem; flex-wrap: wrap; }
+      .recent-grid { display: flex; gap: 1rem; overflow-x: auto; padding-bottom: .3rem; scroll-snap-type: x mandatory; }
+      .recent-grid .book-card { flex: 0 0 132px; scroll-snap-align: start; }
     `;
     document.head.appendChild(style);
   }
@@ -87,12 +89,53 @@
     if (!existingSlot && dlBtn) dlBtn.closest('.book-dl').before(container);
   }
 
+  // How many books the "Đọc gần đây" shelf shows — enough to fill a
+  // horizontal scroll row without turning into an unbounded list of every
+  // book ever opened.
+  const RECENT_LIMIT = 10;
+
+  // Home-page-only "continue reading" shelf, prepended above the category
+  // sections — same idea as the iOS app's own recent-reads row. Built by
+  // cloning each matching .book-card already rendered further down the
+  // page (cover/title/author markup, plus renderLibraryBadges' "Đang đọc:
+  // Chương N" badge, called before this) rather than fetching book
+  // metadata separately — this page already has everything needed once a
+  // book has an entry in /api/progress. The clone's link is rewritten to
+  // jump straight into the last-read chapter, not the book's chapter list.
+  function renderRecentSection(progress) {
+    const wrap = document.getElementById('home-wrap');
+    if (!wrap) return;
+
+    const entries = Object.entries(progress)
+      .filter(([, p]) => p && p.updated_at)
+      .sort((a, b) => new Date(b[1].updated_at) - new Date(a[1].updated_at))
+      .slice(0, RECENT_LIMIT);
+    if (!entries.length) return;
+
+    const cards = [];
+    entries.forEach(([id, p]) => {
+      const original = wrap.querySelector(`.book-card[data-id="${id}"]`);
+      if (!original) return; // book no longer in the library
+      const clone = original.cloneNode(true);
+      clone.href = `books/${id}/chapters/${pad4(p.chapter)}.html`;
+      cards.push(clone);
+    });
+    if (!cards.length) return;
+
+    const section = document.createElement('section');
+    section.className = 'category recent-section';
+    section.innerHTML = '<h2>Đọc gần đây</h2><div class="book-grid recent-grid"></div>';
+    section.querySelector('.recent-grid').append(...cards);
+    wrap.prepend(section);
+  }
+
   async function init() {
     if (!document.querySelector('.book-card') && !document.getElementById('book-dl-btn')) return;
     injectStyles();
     const progress = await fetchProgress();
     renderLibraryBadges(progress);
     renderBookActions(progress);
+    renderRecentSection(progress);
   }
 
   if (document.readyState === 'loading') {
