@@ -39,7 +39,14 @@
       .progress-badge { display: block; margin-top: .1rem; font-size: .72rem; color: var(--accent); font-weight: 600; }
       .book-reading-actions { display: flex; gap: .5rem; margin-top: 1rem; flex-wrap: wrap; }
       .recent-grid { display: flex; gap: 1rem; overflow-x: auto; padding-bottom: .3rem; scroll-snap-type: x mandatory; }
-      .recent-grid .book-card { flex: 0 0 132px; scroll-snap-align: start; }
+      /* min-width:0 overrides the flex item's default automatic minimum
+         size — without it, a card whose cover file happens to have a
+         small natural resolution (some covers are ~120-160px wide source
+         files, most are 300px+) gets floored wider than flex-basis by its
+         own <img>'s intrinsic size, breaking the shelf's otherwise-uniform
+         card width. Classic flexbox "min-width: auto" gotcha, confirmed
+         live: without this, those cards render ~130-160px instead of 132px. */
+      .recent-grid .book-card { flex: 0 0 132px; min-width: 0; scroll-snap-align: start; }
     `;
     document.head.appendChild(style);
   }
