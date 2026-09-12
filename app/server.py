@@ -309,6 +309,58 @@ def progress_update():
     return record
 
 
+def _filter_words_path(site_dir):
+    return Path(site_dir) / "filter_words.json"
+
+
+def _load_filter_words(site_dir):
+    path = _filter_words_path(site_dir)
+    if not path.exists():
+        # A real (epoch) timestamp rather than null — the iOS client's
+        # JSONDecoder always expects a date string here, and epoch sorts
+        # older than any locally-seeded default so a device with its own
+        # defaults still wins the last-write-wins comparison and pushes
+        # them up, instead of failing to decode this response at all.
+        return {"rules": [], "updated_at": "1970-01-01T00:00:00.000Z"}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _save_filter_words(site_dir, data):
+    _filter_words_path(site_dir).write_text(json.dumps(data), encoding="utf-8")
+
+
+# Single shared list (not keyed by book id like progress.json) — the iOS
+# app's filter-words settings screen (tts-novel-ios repo) edits one list per
+# account, synced whole-list-at-once with last-write-wins on `updated_at`
+# rather than a per-rule merge.
+@app.route("/api/filter-words", methods=["GET"])
+@require_auth
+def filter_words_list():
+    return _load_filter_words(SITE_DIR)
+
+
+@app.route("/api/filter-words", methods=["POST"])
+@require_auth
+def filter_words_update():
+    body = request.get_json(force=True, silent=True) or {}
+    rules = body.get("rules")
+    if not isinstance(rules, list):
+        abort(400)
+    for rule in rules:
+        if not isinstance(rule, dict) or not isinstance(rule.get("pattern"), str):
+            abort(400)
+
+    # Server stamps its own clock, same reasoning as progress_update above —
+    # every timestamp compared during the client's last-write-wins merge was
+    # then issued by the same clock regardless of which device pushed.
+    data = {
+        "rules": rules,
+        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    _save_filter_words(SITE_DIR, data)
+    return data
+
+
 def _bug_reports_dir(site_dir):
     d = Path(site_dir) / "bug_reports"
     d.mkdir(parents=True, exist_ok=True)
