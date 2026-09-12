@@ -142,7 +142,11 @@ def _looks_like_toc_dump(text: str) -> bool:
     return marker_lines >= 2 and marker_lines / len(lines) > 0.5
 
 
-def _split_by_chapter_markers(text: str, min_gap: int = 200) -> list[tuple[str, str]] | None:
+def _split_by_chapter_markers(text: str, min_gap: int = 200) -> tuple[str, list[tuple[str, str]]] | None:
+    """Returns (leading_text, sub_chapters). leading_text is whatever comes
+    before the first marker in this text — normally front matter/empty, but
+    see _extract_chapters_from_book for the one case (a chapter's own body
+    landing in the *next* physical spine file) where a caller needs it."""
     matches = list(_CHAPTER_MARKER_RE.finditer(text))
 
     boundaries: list[tuple[int, str]] = []
@@ -156,6 +160,7 @@ def _split_by_chapter_markers(text: str, min_gap: int = 200) -> list[tuple[str, 
     if len(boundaries) < 2:
         return None  # not enough real markers to justify splitting
 
+    leading_text = text[: boundaries[0][0]]
     sub_chapters = []
     for i, (pos, title) in enumerate(boundaries):
         end = boundaries[i + 1][0] if i + 1 < len(boundaries) else len(text)
@@ -164,7 +169,7 @@ def _split_by_chapter_markers(text: str, min_gap: int = 200) -> list[tuple[str, 
         if _looks_like_toc_dump(body_text):
             continue
         sub_chapters.append((title, body_text))
-    return sub_chapters
+    return leading_text, sub_chapters
 
 
 def _text_to_html(text: str) -> str:
@@ -192,6 +197,170 @@ _JUNK_LINE_RE = re.compile(
     r"ng(?:ườ|uo)i\s*l(?:à|a)m\s*s(?:á|a)ch|nguồn\s*[:：]|sưu\s*t(?:ầ|a)m",
     re.IGNORECASE,
 )
+
+
+# --- Whole-chapter junk detection -------------------------------------------
+#
+# The checks above (_JUNK_LINE_RE etc.) strip junk *lines* out of an
+# otherwise-real chapter. The patterns below catch entire *chapters* that
+# are epub-splitting artifacts, not story content at all — found by
+# manually auditing ~150 real-world epubs against their raw source
+# (tools/audit_short_chapters.py reports these same categories without
+# deleting anything, which is how they were verified before this filter
+# was added):
+#
+#   TOC_DUMP          — a "Contents"/mục lục page kept as its own spine
+#                        item; its link text survives _clean_html_and_text
+#                        (it doesn't match _CHAPTER_MARKER_RE) so it looks
+#                        like a short "chapter" that's really just a list.
+#   DIVIDER           — some epubs ship a tiny "part divider" file (body is
+#                        just the chapter number, e.g. "1") immediately
+#                        before the real content file for the same
+#                        chapter — both become separate chapters, but the
+#                        divider carries no content the very next chapter
+#                        doesn't already have.
+#   FRONT_MATTER      — an ad/copyright/dedication page: real epub content,
+#                        but never story prose.
+#   MISSING_IN_SOURCE — the chapter's raw epub source file is itself only a
+#                        translator-credit line or a couple of stray
+#                        words — the story text was never in the epub, not
+#                        something our own cleanup ate.
+#
+# Two related shapes are deliberately left alone (not auto-dropped): a
+# chapter whose raw source is a lot longer than what survived (more likely
+# our own stripping ate real content than the epub being that broken), and
+# a short chapter that just reads like real, if terse, content.
+_JUNK_CHAPTER_CHAR_LIMIT = 400
+
+_TOC_TITLE_RE = re.compile(r"mục\s*lục|table of contents|^contents$|danh\s*sách\s*chương|^index$", re.IGNORECASE)
+_FRONT_MATTER_TITLE_RE = re.compile(
+    r"^(also in series|about the author|acknowledg|dedication|copyright|"
+    r"disclaimer|author'?s note|translator'?s note|lời tựa|lời cảm ơn|"
+    r"lời giới thiệu của (?:tác giả|dịch giả))",
+    re.IGNORECASE,
+)
+# A "list-like" line: a bare number/roman numeral optionally followed by a
+# dot, or a short "N. Title" line — the shape of a surviving TOC entry.
+_LIST_LINE_RE = re.compile(r"^\s*\d{1,4}\.?\s*.{0,60}$")
+_BARE_NUMBER_RE = re.compile(r"^\s*[\divxlcIVXLC]{1,6}\.?\s*$")
+# _JUNK_LINE_RE is tuned for Vietnamese-source boilerplate; these extra
+# forms (generic "Team:"/"Source:" credits, English "translated by", a
+# site's own "previous/next chapter" nav text bleeding into the body) show
+# up in non-Vietnamese-source books in the corpus.
+_JUNK_ONLY_HINT_RE = re.compile(
+    r"team\s*[:：]|source\s*[:：]|translat|proofread|chương trước|chương sau",
+    re.IGNORECASE,
+)
+
+
+def _nonempty_lines(text: str) -> list[str]:
+    return [ln for ln in text.split("\n") if ln.strip()]
+
+
+def _looks_like_toc_dump_body(text: str) -> bool:
+    lines = _nonempty_lines(text)
+    if not lines:
+        return False
+    list_like = sum(1 for ln in lines if _LIST_LINE_RE.match(ln))
+    return list_like / len(lines) > 0.6 and len(lines) >= 3
+
+
+def _looks_like_bare_number(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and bool(_BARE_NUMBER_RE.match(stripped)) and len(stripped) <= 6
+
+
+def _titles_name_same_chapter(a: str, b: str) -> bool:
+    """True for e.g. "1. Roll for Survival" vs "Roll for Survival" — same
+    chapter, one title still carrying the divider file's leading number."""
+    norm_a = re.sub(r"^\s*\d+[\.\):]?\s*", "", a).strip().lower()
+    norm_b = re.sub(r"^\s*\d+[\.\):]?\s*", "", b).strip().lower()
+    if not norm_a or not norm_b:
+        return False
+    return norm_a == norm_b or norm_a in norm_b or norm_b in norm_a
+
+
+def _looks_like_junk_only(text: str) -> bool:
+    lines = _nonempty_lines(text)
+    if not lines:
+        return False
+    return all(_JUNK_LINE_RE.search(ln) or _JUNK_ONLY_HINT_RE.search(ln) for ln in lines)
+
+
+def _has_junk_hint(text: str) -> bool:
+    return bool(_JUNK_LINE_RE.search(text) or _JUNK_ONLY_HINT_RE.search(text))
+
+
+def _looks_like_bare_fragment(text: str) -> bool:
+    """A single word/token with no sentence punctuation — e.g. "Ngôn" left
+    behind when a chapter's title wrapped across two lines in the source
+    and only the second line survived as "body". A real sentence, even a
+    terse one, has a space in it ("Some text.", "Tuyền!" alone doesn't
+    count as prose either, but always shows up next to an explicit junk
+    hint line — see _has_junk_hint above — so this only needs to catch the
+    no-hint, no-space case)."""
+    stripped = text.strip()
+    return bool(stripped) and " " not in stripped and len(stripped) <= 30
+
+
+def _is_junk_chapter(title: str, text: str, raw_len: int, prev_title: str | None, next_title: str | None) -> bool:
+    """True if this whole chapter is a splitting artifact (see categories
+    above) rather than real (if sometimes terse) story content."""
+    if not text.strip():
+        return True  # nothing here at all — trivially not real content
+
+    is_toc_shaped = bool(_TOC_TITLE_RE.search(title) or _looks_like_toc_dump_body(text))
+    if not is_toc_shaped and len(text) > _JUNK_CHAPTER_CHAR_LIMIT:
+        return False  # long, real-looking content — never a splitting artifact
+
+    if is_toc_shaped:
+        return True
+    if _FRONT_MATTER_TITLE_RE.search(title):
+        return True
+    if _looks_like_bare_number(text) and (
+        (next_title and _titles_name_same_chapter(title, next_title))
+        or (prev_title and _titles_name_same_chapter(title, prev_title))
+    ):
+        return True
+
+    # raw_len is the pre-boilerplate-stripping text length for this
+    # chapter's physical source — comparing it (not the raw HTML byte
+    # count, which is dominated by near-constant DOCTYPE/xmlns overhead)
+    # against the final text tells apart "the epub itself never had more
+    # than this" from "something upstream of here ate real content".
+    raw_is_also_short = raw_len > 0 and raw_len < max(300, len(text) * 3)
+    if raw_is_also_short:
+        lines = _nonempty_lines(text)
+        # line count alone isn't a safe signal (a real multi-thousand-char
+        # chapter can render as one unbroken line if the source has no
+        # internal <p>/<br> breaks) — each branch below also requires an
+        # explicit sign the body itself is junk (a credit/nav-boilerplate
+        # phrase, or a single punctuation-less word/number fragment), not
+        # just shortness on its own — a real one-sentence chapter is short
+        # too, but reads like a sentence and names no credit/nav phrase.
+        if (
+            _looks_like_junk_only(text)
+            or (len(lines) <= 2 and len(text) <= 80 and _has_junk_hint(text))
+            or _looks_like_bare_fragment(text)
+        ):
+            return True
+
+    return False
+
+
+def _drop_junk_chapters(chapters: list["Chapter"], raw_lens: list[int]) -> list["Chapter"]:
+    kept = [
+        ch
+        for i, ch in enumerate(chapters)
+        if not _is_junk_chapter(
+            ch.title,
+            ch.text,
+            raw_lens[i],
+            chapters[i - 1].title if i > 0 else None,
+            chapters[i + 1].title if i + 1 < len(chapters) else None,
+        )
+    ]
+    return [Chapter(index=i, title=c.title, html=c.html, text=c.text) for i, c in enumerate(kept)]
 
 
 def _normalize_for_compare(s: str) -> str:
@@ -265,6 +434,10 @@ def _extract_chapters_from_book(book: epub.EpubBook) -> list[Chapter]:
     toc_titles = _toc_titles_by_href(book.toc)
 
     chapters: list[Chapter] = []
+    # Pre-boilerplate-stripping text length per chapter, parallel to
+    # `chapters` — see _is_junk_chapter for why this (not raw HTML byte
+    # size) is the right comparison for "did the epub itself have more?".
+    raw_lens: list[int] = []
     for idx, (idref, linear) in enumerate(book.spine):
         if linear == "no":
             continue
@@ -289,14 +462,39 @@ def _extract_chapters_from_book(book: epub.EpubBook) -> list[Chapter]:
         # change behavior for any book we didn't generate ourselves.
         split = None if _CHAPTER_ALREADY_SPLIT_MARKER in raw else _split_by_chapter_markers(text)
         if split is not None:
-            for sub_title, sub_text in split:
-                sub_text = _strip_leading_boilerplate_text(sub_text, sub_title)
+            leading_text, sub_chapters = split
+            # Some epubs are auto-chunked into fixed-size physical files
+            # (e.g. index_split_003.html) with no regard for chapter
+            # boundaries — a chapter's own marker can end up as the very
+            # last thing in one file, with its actual body starting the
+            # next file with no marker of its own (the marker already
+            # appeared once). _split_by_chapter_markers only captures text
+            # *from* a matched marker onward, so without this, that body
+            # is silently dropped. The signal that the previous chapter is
+            # really the truncated half of this file's leading text (not
+            # unrelated front matter) is that its own recorded raw length
+            # was ~nothing — i.e. its source file ended right after its
+            # marker line.
+            if leading_text.strip() and chapters and raw_lens and raw_lens[-1] <= 20:
+                prev = chapters[-1]
+                recovered_text = _strip_leading_boilerplate_text(leading_text, prev.title)
+                if recovered_text:
+                    chapters[-1] = Chapter(
+                        index=prev.index,
+                        title=prev.title,
+                        html=_text_to_html(recovered_text),
+                        text=recovered_text,
+                    )
+                    raw_lens[-1] += len(leading_text)
+            for sub_title, sub_text_raw in sub_chapters:
+                sub_text = _strip_leading_boilerplate_text(sub_text_raw, sub_title)
                 chapters.append(Chapter(
                     index=len(chapters),
                     title=sub_title,
                     html=_text_to_html(sub_text),
                     text=sub_text,
                 ))
+                raw_lens.append(len(sub_text_raw))
             continue
 
         title = toc_titles.get(item.get_name()) or _fallback_title(html, len(chapters))
@@ -310,13 +508,15 @@ def _extract_chapters_from_book(book: epub.EpubBook) -> list[Chapter]:
             and not _STARTS_WITH_MARKER_RE.match(text)
         ):
             title = "Giới thiệu"
+        pre_strip_text = text
         html = _strip_leading_boilerplate_html(html, title)
         text = BeautifulSoup(html, "lxml").get_text(separator="\n", strip=True)
         if not text or _normalize_for_compare(text) == _normalize_for_compare(title):
             continue  # blank page in the source (e.g. a scan with no OCR'd body) — nothing to show
         chapters.append(Chapter(index=len(chapters), title=title, html=html, text=text))
+        raw_lens.append(len(pre_strip_text))
 
-    return chapters
+    return _drop_junk_chapters(chapters, raw_lens)
 
 
 def extract_chapters(epub_path: str) -> list[Chapter]:
@@ -403,7 +603,8 @@ def extract_book_from_mobi(path: str) -> tuple[dict, list[Chapter]]:
         chapters: list[Chapter] = []
         split = _split_by_chapter_markers(text)
         if split is not None:
-            for sub_title, sub_text in split:
+            _leading_text, sub_chapters = split
+            for sub_title, sub_text in sub_chapters:
                 sub_text = _strip_leading_boilerplate_text(sub_text, sub_title)
                 chapters.append(Chapter(
                     index=len(chapters), title=sub_title, html=_text_to_html(sub_text), text=sub_text,

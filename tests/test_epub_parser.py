@@ -111,3 +111,98 @@ def test_fallback_title_when_toc_missing():
         chapters = extract_chapters(epub_path)
         assert len(chapters) == 1
         assert chapters[0].title == "Untitled Chapter"
+
+
+def _write_book(path: str, spine_items: list, toc: tuple = ()) -> None:
+    book = epub.EpubBook()
+    book.set_identifier("junk-chapter-id")
+    book.set_title("Junk Chapter Novel")
+    book.set_language("vi")
+    for item in spine_items:
+        book.add_item(item)
+    book.toc = toc
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ["nav", *spine_items]
+    epub.write_epub(path, book)
+
+
+def test_drops_toc_dump_page():
+    """A "Contents" page kept as its own spine item: its link text
+    survives _clean_html_and_text (no "Chương N" prefix to match), so
+    without this filter it would look like its own short chapter."""
+    with tempfile.TemporaryDirectory() as tmp:
+        epub_path = str(Path(tmp) / "toc_dump.epub")
+        toc_page = epub.EpubHtml(title="Contents", file_name="toc.xhtml", lang="vi")
+        toc_page.content = "<html><body><h1>Contents</h1><p>1.</p><p>2.</p><p>3.</p><p>4.</p></body></html>"
+        c1 = epub.EpubHtml(title="Chương 1", file_name="chap_01.xhtml", lang="vi")
+        c1.content = "<html><body><h1>Chương 1</h1><p>Nội dung chương một thật dài và đầy đủ.</p></body></html>"
+        _write_book(epub_path, [toc_page, c1])
+
+        chapters = extract_chapters(epub_path)
+        assert [c.title for c in chapters] == ["Chương 1"]
+
+
+def test_drops_divider_chapter_with_duplicate_content():
+    """Some epubs ship a tiny "part divider" file (body is just the
+    chapter number) immediately before the real content file for the same
+    chapter — the divider carries no content the next chapter lacks."""
+    with tempfile.TemporaryDirectory() as tmp:
+        epub_path = str(Path(tmp) / "divider.epub")
+        divider = epub.EpubHtml(title="1. Roll for Survival", file_name="divider_01.xhtml", lang="en")
+        divider.content = "<html><body><p>1</p></body></html>"
+        content = epub.EpubHtml(title="Roll for Survival", file_name="chap_01.xhtml", lang="en")
+        content.content = "<html><body><h1>Roll for Survival</h1><p>A wall of real chapter text goes here.</p></body></html>"
+        toc = (
+            epub.Link("divider_01.xhtml", "1. Roll for Survival", "d1"),
+            epub.Link("chap_01.xhtml", "Roll for Survival", "c1"),
+        )
+        _write_book(epub_path, [divider, content], toc=toc)
+
+        chapters = extract_chapters(epub_path)
+        assert [c.title for c in chapters] == ["Roll for Survival"]
+
+
+def test_drops_front_matter_page():
+    """An ad/copyright/dedication page is real epub content but never
+    story prose — dropped outright rather than shown as a "chapter"."""
+    with tempfile.TemporaryDirectory() as tmp:
+        epub_path = str(Path(tmp) / "front_matter.epub")
+        ad_page = epub.EpubHtml(title="Also in series", file_name="ad.xhtml", lang="en")
+        ad_page.content = "<html><body><h1>Also in Series</h1><p>Defiance of the Fall</p></body></html>"
+        c1 = epub.EpubHtml(title="Chapter 1", file_name="chap_01.xhtml", lang="en")
+        c1.content = "<html><body><h1>Chapter 1</h1><p>A wall of real chapter text goes here.</p></body></html>"
+        _write_book(epub_path, [ad_page, c1])
+
+        chapters = extract_chapters(epub_path)
+        assert [c.title for c in chapters] == ["Chapter 1"]
+
+
+def test_drops_chapter_whose_raw_source_is_credit_line_only():
+    """The raw epub source file for this chapter is nothing but a
+    translator-credit line — the story text was never in the epub, not
+    something our own boilerplate stripping ate."""
+    with tempfile.TemporaryDirectory() as tmp:
+        epub_path = str(Path(tmp) / "missing_content.epub")
+        c1 = epub.EpubHtml(title="Chương 1", file_name="chap_01.xhtml", lang="vi")
+        c1.content = "<html><body><h1>Chương 1</h1><p>Team: Vạn Yên Chi Sào</p><p>Nguồn: Truyenyy.com</p></body></html>"
+        c2 = epub.EpubHtml(title="Chương 2", file_name="chap_02.xhtml", lang="vi")
+        c2.content = "<html><body><h1>Chương 2</h1><p>Nội dung chương hai thật dài và đầy đủ.</p></body></html>"
+        _write_book(epub_path, [c1, c2])
+
+        chapters = extract_chapters(epub_path)
+        assert [c.title for c in chapters] == ["Chương 2"]
+
+
+def test_keeps_short_chapter_that_reads_like_real_content():
+    """A short chapter with no credit/nav boilerplate and no bare-number
+    body should survive — being short alone is not grounds to drop it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        epub_path = str(Path(tmp) / "short_real.epub")
+        c1 = epub.EpubHtml(title="Chương 1", file_name="chap_01.xhtml", lang="vi")
+        c1.content = "<html><body><h1>Chương 1</h1><p>Nội dung chương một.</p></body></html>"
+        _write_book(epub_path, [c1])
+
+        chapters = extract_chapters(epub_path)
+        assert [c.title for c in chapters] == ["Chương 1"]
+        assert "Nội dung chương một." in chapters[0].text
