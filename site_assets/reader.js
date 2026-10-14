@@ -98,18 +98,32 @@
 
   // Translation engines offered in the settings panel's "Dịch" section —
   // same idea as the app's TranslationEngineKind: reader.js only ever goes
-  // through load()/convert()/needsTranslation(), so adding an engine is
-  // one more entry here. Only VietPhrase (Hán Việt, see hanviet.js) today.
-  const TRANSLATION_ENGINES = {
-    vietphrase: { name: 'VietPhrase (Hán Việt)', get: () => window.HanViet },
-  };
+  // through needsTranslation(text) and translate(container, chapterNum)
+  // (which rewrites a detached copy of the chapter fragment in place), so
+  // adding an engine is one more entry here. Defined below, next to the
+  // Google implementation they reference.
+  let TRANSLATION_ENGINES = null;
+
+  // The Google-only "Dịch sang tiếng Việt" checkbox this section replaced
+  // stored reader.translate=1 — carry that choice over as the Google engine.
+  if (localStorage.getItem('reader.translate') === '1' && !localStorage.getItem('reader.translateEngine')) {
+    localStorage.setItem('reader.translateEngine', 'google');
+    localStorage.setItem('reader.autoTranslate', '1');
+  }
+  localStorage.removeItem('reader.translate');
 
   // Per-chapter translation state, reset by goToChapter() on every chapter
   // load. The fragment HTML exactly as fetched is kept so toggling back to
-  // the original is just re-injecting it — no refetch, no reverse mapping.
+  // the original is just re-injecting it — no refetch, no reverse mapping —
+  // and the translated HTML once made, so toggling back to it doesn't hit
+  // the engine (and for Google, the network) again.
   let chapterOriginalHtml = '';
+  let chapterTranslatedHtml = null;
   let chapterNeedsTranslation = false;
   let showingTranslation = false;
+  // Bumped per render so a slow translation for a chapter the reader has
+  // since left can't overwrite the one now showing.
+  let renderGeneration = 0;
 
   // The block elements wrapContentSentences() turns into sentences.
   const SENTENCE_BLOCKS = 'p, h1, h2, h3, h4, li';
@@ -243,14 +257,9 @@
   // detached fragment (prefetched chapter HTML not yet in the document) —
   // uses textContent instead of innerText since innerText needs the node
   // to actually be laid out/rendered, which a detached container never is.
-  // Converted first if the chapter will show translated (see
-  // goToChapter), so the prefetched audio matches what will actually be
-  // read.
   function firstSentenceOf(html) {
     const tmp = document.createElement('div');
     tmp.innerHTML = html;
-    const engine = currentTranslationEngine();
-    if (autoTranslateOn() && engine && engine.needsTranslation(tmp.textContent)) convertTextNodes(tmp, engine);
     const nodes = tmp.querySelectorAll(SENTENCE_BLOCKS);
     for (const node of nodes) {
       if (node.dataset.readerSkip !== undefined) continue;
@@ -273,16 +282,21 @@
     if (nextNum >= totalChapters) return;
     if (nextChapterPrefetch && nextChapterPrefetch.num === nextNum) return;
 
-    const entry = { num: nextNum, html: null, firstSentence: null, audioPromise: null };
+    const entry = { num: nextNum, html: null, translatedHtml: null, firstSentence: null, audioPromise: null };
     nextChapterPrefetch = entry;
     fetch(`/books/${bookId}/data/${pad4(nextNum)}.html`)
       .then((r) => {
         if (!r.ok) throw new Error(`fetch chapter failed: ${r.status}`);
         return r.text();
       })
-      .then((html) => {
+      .then(async (html) => {
         entry.html = html;
-        const firstSentence = firstSentenceOf(html);
+        // Translated ahead too if the chapter will show translated (see
+        // goToChapter), so neither the translation nor the first sentence's
+        // audio has to wait at the chapter boundary — and the audio is for
+        // the text that will actually be read.
+        entry.translatedHtml = autoTranslateOn() ? await translateHtml(html, nextNum).catch(() => null) : null;
+        const firstSentence = firstSentenceOf(entry.translatedHtml ?? html);
         entry.firstSentence = firstSentence;
         if (firstSentence) entry.audioPromise = fetchAudioUrl(firstSentence);
       })
@@ -523,7 +537,7 @@
   // place — no navigation, so the audio-unlock state (and this whole
   // script's in-memory state) survives across chapters. Throws on failure;
   // callers decide how to react.
-  async function goToChapter(num, prefetchedHtml) {
+  async function goToChapter(num, prefetchedHtml, prefetchedTranslation) {
     let html = prefetchedHtml;
     if (html == null) {
       const resp = await fetch(`/books/${bookId}/data/${pad4(num)}.html`);
@@ -531,17 +545,15 @@
       html = await resp.text();
     }
     chapterOriginalHtml = html;
-    const tmp = document.createElement('div');
-    tmp.innerHTML = html;
-    const engine = currentTranslationEngine();
-    chapterNeedsTranslation = !!engine && engine.needsTranslation(tmp.textContent);
+    chapterTranslatedHtml = prefetchedTranslation ?? null;
+    chapterNeedsTranslation = currentTranslationEngine().needsTranslation(textOfHtml(html));
     // Same rule as the app: each new chapter starts out showing whatever
     // auto-translate says, regardless of what the previous one was toggled to.
     showingTranslation = chapterNeedsTranslation && autoTranslateOn();
+    currentChapterNum = num;
     await renderChapterContent();
     updateTranslateBtn();
 
-    currentChapterNum = num;
     updateChapterNav();
     const h1 = document.querySelector('article h1');
     document.title = `${h1 ? h1.textContent.trim() : ''} — ${bookTitle}`;
@@ -554,42 +566,143 @@
   }
 
   function currentTranslationEngine() {
-    const entry = TRANSLATION_ENGINES[localStorage.getItem('reader.translateEngine')] || TRANSLATION_ENGINES.vietphrase;
-    return entry.get() || null;
+    return TRANSLATION_ENGINES[localStorage.getItem('reader.translateEngine')] || TRANSLATION_ENGINES.vietphrase;
+  }
+
+  function textOfHtml(html) {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    return tmp.textContent;
   }
 
   // Converts every text node under `root` in place, so the fragment's own
   // <p>/<h1>/<br> structure survives untouched.
-  function convertTextNodes(root, engine) {
+  function convertTextNodes(root, converter) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    for (let n = walker.nextNode(); n; n = walker.nextNode()) n.nodeValue = engine.convert(n.nodeValue);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) n.nodeValue = converter.convert(n.nodeValue);
   }
 
-  // (Re)fills <article> from chapterOriginalHtml — converted if
-  // showingTranslation. The engine's dictionary is loaded on first use
-  // only; if that fails the original text stays up and the error shows in
-  // the settings panel.
+  // ── Google Cloud Translation v3 via /api/translate ────────────────────────
+  // Translated paragraph by paragraph. The server stores every translated
+  // paragraph (shared with the iOS/macOS app) and applies the book's
+  // glossary, so a re-read chapter comes straight back from storage.
+  const TRANSLATE_TARGET = 'vi';
+  const TRANSLATE_CHUNK_SEGMENTS = 80;
+  const TRANSLATE_CHUNK_CHARS = 20000;
+  const VI_CHARS = /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/gi;
+
+  // Source language of a chapter, or null when it's already Vietnamese.
+  function detectSourceLanguage(text) {
+    const letters = (text.match(/\p{L}/gu) || []).length;
+    if (!letters) return null;
+    if ((text.match(VI_CHARS) || []).length / letters > 0.03) return null;
+    if ((text.match(/[一-鿿]/g) || []).length / letters > 0.3) return 'zh';
+    return 'en';
+  }
+
+  function translatableNodes(container) {
+    return Array.from(container.querySelectorAll(SENTENCE_BLOCKS)).filter(
+      (node) =>
+        node.dataset.readerSkip === undefined &&
+        !node.querySelector(SENTENCE_BLOCKS) &&
+        node.textContent.trim().length > 0
+    );
+  }
+
+  async function postTranslate(num, source, texts) {
+    const resp = await fetch('/api/translate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ book_id: parseInt(bookId, 10), chapter: num, source, target: TRANSLATE_TARGET, texts }),
+    });
+    if (!resp.ok) throw new Error(`translate failed: ${resp.status}`);
+    return (await resp.json()).translations;
+  }
+
+  async function googleTranslate(container, num) {
+    const nodes = translatableNodes(container);
+    const texts = nodes.map((node) => node.textContent.replace(/\s+/g, ' ').trim());
+    const source = detectSourceLanguage(texts.join(' '));
+    if (!source) return;
+
+    const chunks = [];
+    let current = [];
+    let chars = 0;
+    texts.forEach((text, i) => {
+      if (current.length && (current.length >= TRANSLATE_CHUNK_SEGMENTS || chars + text.length > TRANSLATE_CHUNK_CHARS)) {
+        chunks.push(current);
+        current = [];
+        chars = 0;
+      }
+      current.push(i);
+      chars += text.length;
+    });
+    if (current.length) chunks.push(current);
+
+    const t0 = performance.now();
+    const results = await Promise.all(chunks.map((idxs) => postTranslate(num, source, idxs.map((i) => texts[i]))));
+    chunks.forEach((idxs, c) => idxs.forEach((i, k) => (nodes[i].textContent = results[c][k])));
+    console.log(`reader.js: translated ${texts.length} paragraphs (${source}→${TRANSLATE_TARGET}) in ${(performance.now() - t0).toFixed(0)}ms`);
+  }
+
+  TRANSLATION_ENGINES = {
+    vietphrase: {
+      name: 'VietPhrase (Hán Việt)',
+      needsTranslation: (text) => !!window.HanViet && window.HanViet.needsTranslation(text),
+      translate: async (container) => {
+        await window.HanViet.load();
+        convertTextNodes(container, window.HanViet);
+      },
+    },
+    google: {
+      name: 'Google Translate',
+      needsTranslation: (text) => detectSourceLanguage(text) !== null,
+      translate: googleTranslate,
+    },
+  };
+
+  // `html` translated by the current engine, or null if the chapter
+  // doesn't need it. Throws if the engine fails.
+  async function translateHtml(html, num) {
+    const engine = currentTranslationEngine();
+    if (!engine.needsTranslation(textOfHtml(html))) return null;
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    await engine.translate(tmp, num);
+    return tmp.innerHTML;
+  }
+
+  // (Re)fills <article> from chapterOriginalHtml — translated if
+  // showingTranslation. If the engine fails (dictionary/network) the
+  // original text stays up and the error shows in the settings panel.
   async function renderChapterContent() {
     const article = document.querySelector('article');
+    const generation = ++renderGeneration;
     article.innerHTML = chapterOriginalHtml;
     if (!showingTranslation) return;
-    const engine = currentTranslationEngine();
-    try {
-      await engine.load();
-    } catch (e) {
-      showingTranslation = false;
-      updateTranslateBtn();
-      showReaderError(`Lỗi dịch: ${(e && e.message) || e}`);
-      return;
+    if (chapterTranslatedHtml == null) {
+      if (els) els.translateToggle.classList.add('busy');
+      try {
+        chapterTranslatedHtml = await translateHtml(chapterOriginalHtml, currentChapterNum);
+      } catch (e) {
+        if (generation !== renderGeneration) return;
+        showingTranslation = false;
+        updateTranslateBtn();
+        showReaderError(`Không dịch được chương này — đang hiển thị bản gốc. (${(e && e.message) || e})`);
+        return;
+      } finally {
+        if (els && generation === renderGeneration) els.translateToggle.classList.remove('busy');
+      }
+      if (generation !== renderGeneration) return;
     }
-    convertTextNodes(article, engine);
+    if (chapterTranslatedHtml != null) article.innerHTML = chapterTranslatedHtml;
   }
 
   function updateTranslateBtn() {
     if (!els) return;
     els.translateToggle.hidden = !chapterNeedsTranslation;
     els.translateToggle.classList.toggle('on', showingTranslation);
-    els.translateToggle.title = showingTranslation ? 'Xem bản gốc' : 'Dịch Hán Việt';
+    els.translateToggle.title = showingTranslation ? 'Xem bản gốc' : 'Dịch chương';
   }
 
   // Index (into SENTENCE_BLOCKS) of the paragraph holding sentence `i` —
@@ -614,13 +727,19 @@
   // original and translated text. Like the app, the words being read just
   // changed, so any playing/preloaded audio is dropped and playback picks
   // back up at the start of the same paragraph in the new text.
-  async function toggleTranslation() {
+  function toggleTranslation() {
     if (!chapterNeedsTranslation) return;
+    return rerenderChapter(!showingTranslation);
+  }
+
+  // Swaps what <article> shows for the current chapter, keeping the
+  // reading position by paragraph and resuming playback if it was going.
+  async function rerenderChapter(show) {
     const wasPlaying = active && !paused;
     const block = sentences.length ? blockIndexOfSentence(index) : -1;
     if (active) stop();
     nextChapterPrefetch = null;
-    showingTranslation = !showingTranslation;
+    showingTranslation = show;
     await renderChapterContent();
     updateTranslateBtn();
     if (block >= 0) {
@@ -739,7 +858,7 @@
       nextChapterPrefetch = null;
 
       try {
-        await goToChapter(nextNum, prefetched ? prefetched.html ?? undefined : undefined);
+        await goToChapter(nextNum, prefetched?.html ?? undefined, prefetched?.translatedHtml);
       } catch (e) {
         console.error('reader.js: auto-advance failed to load next chapter ::', (e && e.message) || e);
         showReaderError(`Lỗi tải chương tiếp theo: ${(e && e.message) || e}`);
@@ -990,7 +1109,7 @@
         <span data-role="progress">0 / 0</span>
         <span class="reader-preload" data-role="preload" title="Số câu đã tải trước">0 / 0</span>
       </span>
-      <button class="reader-btn reader-btn-ghost" data-role="translateToggle" title="Dịch Hán Việt" hidden>文</button>
+      <button class="reader-btn reader-btn-ghost" data-role="translateToggle" title="Dịch chương" hidden>文</button>
       <button class="reader-btn reader-btn-ghost" data-role="settingsToggle" title="Cài đặt đọc">⚙</button>
     `;
 
@@ -1044,7 +1163,7 @@
       </label>
       <label class="reader-settings-checkbox">
         <input type="checkbox" data-role="autoTranslate">
-        Tự động dịch chương tiếng Trung
+        Tự động dịch chương không phải tiếng Việt
       </label>
       <div class="reader-settings-heading">Tự động</div>
       <label class="reader-settings-checkbox">
@@ -1116,13 +1235,14 @@
     els.translateEngine.value = TRANSLATION_ENGINES[localStorage.getItem('reader.translateEngine')]
       ? localStorage.getItem('reader.translateEngine')
       : 'vietphrase';
-    els.translateEngine.addEventListener('change', async () => {
+    // Engines disagree on which chapters need translating (VietPhrase only
+    // takes Chinese, Google anything not Vietnamese) — re-evaluate the open
+    // chapter from scratch, same as loading it fresh.
+    els.translateEngine.addEventListener('change', () => {
       localStorage.setItem('reader.translateEngine', els.translateEngine.value);
-      // Re-translate whatever's showing with the newly selected engine.
-      if (showingTranslation) {
-        showingTranslation = false;
-        await toggleTranslation();
-      }
+      chapterTranslatedHtml = null;
+      chapterNeedsTranslation = currentTranslationEngine().needsTranslation(textOfHtml(chapterOriginalHtml));
+      rerenderChapter(chapterNeedsTranslation && autoTranslateOn());
     });
 
     // Applied to the open chapter right away, same as the app's toggle.

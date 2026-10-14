@@ -295,6 +295,8 @@ article p { margin: 0 0 1.1em; font-size: 1.05em; }
    filled with the accent color while the translated text is showing. */
 .reader-btn-ghost[hidden] { display: none; }
 .reader-btn-ghost.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.reader-btn-ghost.busy { animation: reader-busy 1s ease-in-out infinite alternate; }
+@keyframes reader-busy { from { opacity: 1; } to { opacity: .35; } }
 /* Narrower than the old horizontal layout's 4.5rem — that width had to fit
    next to the play/settings buttons in a single row, but stacked in a
    column here it just made the whole pill wider than it needs to be for

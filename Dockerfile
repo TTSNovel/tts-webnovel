@@ -10,6 +10,7 @@ COPY app/epub_parser.py .
 COPY app/classify.py .
 COPY app/book_renderer.py .
 COPY app/build_library.py .
+COPY app/translation.py .
 # Book content itself is NOT baked into the image — it's on the GCS bucket
 # mounted at /mnt/site (see tts-pipeline-infra/environments/dev/main.tf), so
 # /import can add new books at runtime and every instance sees them
