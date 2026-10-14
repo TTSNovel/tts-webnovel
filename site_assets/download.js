@@ -94,6 +94,8 @@
     '/assets/reader.js',
     '/assets/download.js',
     '/assets/piper-offline.js',
+    '/assets/hanviet.js',
+    '/assets/phienam.txt',
     '/assets/icons/icon-192.png',
     '/assets/icons/icon-512.png',
     '/assets/icons/icon-180.png',

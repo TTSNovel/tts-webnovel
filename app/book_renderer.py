@@ -291,6 +291,10 @@ article p { margin: 0 0 1.1em; font-size: 1.05em; }
   display: inline-flex; align-items: center; justify-content: center;
 }
 .reader-btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); font-size: 1.1rem; }
+/* Translate toggle (reader.js) — only shown on chapters that need it;
+   filled with the accent color while the translated text is showing. */
+.reader-btn-ghost[hidden] { display: none; }
+.reader-btn-ghost.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 /* Narrower than the old horizontal layout's 4.5rem — that width had to fit
    next to the play/settings buttons in a single row, but stacked in a
    column here it just made the whole pill wider than it needs to be for
@@ -329,6 +333,7 @@ article p { margin: 0 0 1.1em; font-size: 1.05em; }
   font-size: .85rem; padding: .4rem .5rem;
 }
 .reader-settings-checkbox { flex-direction: row !important; align-items: center; gap: .5rem !important; }
+.reader-settings-heading { margin: .3rem 0 -.2rem; font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .reader-settings-checkbox input { width: auto; }
 .reader-piper-offline { display: flex; align-items: center; gap: .5rem; font-size: .78rem; color: var(--muted); }
 .reader-piper-offline[hidden] { display: none; }
@@ -442,6 +447,7 @@ _CHAPTER_SHELL = """<!doctype html>
 </div>
 <script src="../../../assets/download.js"></script>
 <script src="../../../assets/piper-offline.js"></script>
+<script src="../../../assets/hanviet.js"></script>
 <script src="../../../assets/reader.js"></script>
 </body>
 </html>

@@ -96,6 +96,24 @@
   // failing outright if playback starts before the download finishes.
   let piperOfflineDownloadPromise = null;
 
+  // Translation engines offered in the settings panel's "Dịch" section —
+  // same idea as the app's TranslationEngineKind: reader.js only ever goes
+  // through load()/convert()/needsTranslation(), so adding an engine is
+  // one more entry here. Only VietPhrase (Hán Việt, see hanviet.js) today.
+  const TRANSLATION_ENGINES = {
+    vietphrase: { name: 'VietPhrase (Hán Việt)', get: () => window.HanViet },
+  };
+
+  // Per-chapter translation state, reset by goToChapter() on every chapter
+  // load. The fragment HTML exactly as fetched is kept so toggling back to
+  // the original is just re-injecting it — no refetch, no reverse mapping.
+  let chapterOriginalHtml = '';
+  let chapterNeedsTranslation = false;
+  let showingTranslation = false;
+
+  // The block elements wrapContentSentences() turns into sentences.
+  const SENTENCE_BLOCKS = 'p, h1, h2, h3, h4, li';
+
   function pad4(n) {
     return String(n).padStart(4, '0');
   }
@@ -205,7 +223,7 @@
 
   function wrapContentSentences(container) {
     const result = [];
-    container.querySelectorAll('p, h1, h2, h3, h4, li').forEach((node) => {
+    container.querySelectorAll(SENTENCE_BLOCKS).forEach((node) => {
       if (node.dataset.readerSkip !== undefined) return;
       const text = node.innerText.trim();
       if (!text || text.length < 3) return;
@@ -225,10 +243,15 @@
   // detached fragment (prefetched chapter HTML not yet in the document) —
   // uses textContent instead of innerText since innerText needs the node
   // to actually be laid out/rendered, which a detached container never is.
+  // Converted first if the chapter will show translated (see
+  // goToChapter), so the prefetched audio matches what will actually be
+  // read.
   function firstSentenceOf(html) {
     const tmp = document.createElement('div');
     tmp.innerHTML = html;
-    const nodes = tmp.querySelectorAll('p, h1, h2, h3, h4, li');
+    const engine = currentTranslationEngine();
+    if (autoTranslateOn() && engine && engine.needsTranslation(tmp.textContent)) convertTextNodes(tmp, engine);
+    const nodes = tmp.querySelectorAll(SENTENCE_BLOCKS);
     for (const node of nodes) {
       if (node.dataset.readerSkip !== undefined) continue;
       const text = node.textContent.trim();
@@ -250,7 +273,7 @@
     if (nextNum >= totalChapters) return;
     if (nextChapterPrefetch && nextChapterPrefetch.num === nextNum) return;
 
-    const entry = { num: nextNum, html: null, audioPromise: null };
+    const entry = { num: nextNum, html: null, firstSentence: null, audioPromise: null };
     nextChapterPrefetch = entry;
     fetch(`/books/${bookId}/data/${pad4(nextNum)}.html`)
       .then((r) => {
@@ -260,6 +283,7 @@
       .then((html) => {
         entry.html = html;
         const firstSentence = firstSentenceOf(html);
+        entry.firstSentence = firstSentence;
         if (firstSentence) entry.audioPromise = fetchAudioUrl(firstSentence);
       })
       .catch(() => {
@@ -506,7 +530,16 @@
       if (!resp.ok) throw new Error(`fetch chapter failed: ${resp.status}`);
       html = await resp.text();
     }
-    document.querySelector('article').innerHTML = html;
+    chapterOriginalHtml = html;
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    const engine = currentTranslationEngine();
+    chapterNeedsTranslation = !!engine && engine.needsTranslation(tmp.textContent);
+    // Same rule as the app: each new chapter starts out showing whatever
+    // auto-translate says, regardless of what the previous one was toggled to.
+    showingTranslation = chapterNeedsTranslation && autoTranslateOn();
+    await renderChapterContent();
+    updateTranslateBtn();
 
     currentChapterNum = num;
     updateChapterNav();
@@ -514,6 +547,92 @@
     document.title = `${h1 ? h1.textContent.trim() : ''} — ${bookTitle}`;
     history.replaceState(null, '', `/books/${bookId}/chapters/${pad4(num)}.html`);
     window.scrollTo(0, 0);
+  }
+
+  function autoTranslateOn() {
+    return localStorage.getItem('reader.autoTranslate') !== '0';
+  }
+
+  function currentTranslationEngine() {
+    const entry = TRANSLATION_ENGINES[localStorage.getItem('reader.translateEngine')] || TRANSLATION_ENGINES.vietphrase;
+    return entry.get() || null;
+  }
+
+  // Converts every text node under `root` in place, so the fragment's own
+  // <p>/<h1>/<br> structure survives untouched.
+  function convertTextNodes(root, engine) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) n.nodeValue = engine.convert(n.nodeValue);
+  }
+
+  // (Re)fills <article> from chapterOriginalHtml — converted if
+  // showingTranslation. The engine's dictionary is loaded on first use
+  // only; if that fails the original text stays up and the error shows in
+  // the settings panel.
+  async function renderChapterContent() {
+    const article = document.querySelector('article');
+    article.innerHTML = chapterOriginalHtml;
+    if (!showingTranslation) return;
+    const engine = currentTranslationEngine();
+    try {
+      await engine.load();
+    } catch (e) {
+      showingTranslation = false;
+      updateTranslateBtn();
+      showReaderError(`Lỗi dịch: ${(e && e.message) || e}`);
+      return;
+    }
+    convertTextNodes(article, engine);
+  }
+
+  function updateTranslateBtn() {
+    if (!els) return;
+    els.translateToggle.hidden = !chapterNeedsTranslation;
+    els.translateToggle.classList.toggle('on', showingTranslation);
+    els.translateToggle.title = showingTranslation ? 'Xem bản gốc' : 'Dịch Hán Việt';
+  }
+
+  // Index (into SENTENCE_BLOCKS) of the paragraph holding sentence `i` —
+  // original and translated text split into different sentences, but
+  // their paragraphs line up one to one, so that's what a toggle keeps.
+  function blockIndexOfSentence(i) {
+    const span = document.querySelector(`[data-r-s="${i}"]`);
+    if (!span) return -1;
+    return [...document.querySelectorAll(`article :is(${SENTENCE_BLOCKS})`)].indexOf(span.closest(SENTENCE_BLOCKS));
+  }
+
+  function firstSentenceInBlock(b) {
+    const blocks = document.querySelectorAll(`article :is(${SENTENCE_BLOCKS})`);
+    for (let k = Math.max(b, 0); k < blocks.length; k++) {
+      const span = blocks[k].querySelector('[data-r-s]');
+      if (span) return parseInt(span.dataset.rS, 10);
+    }
+    return 0;
+  }
+
+  // The reader-bar translate button — switches the current chapter between
+  // original and translated text. Like the app, the words being read just
+  // changed, so any playing/preloaded audio is dropped and playback picks
+  // back up at the start of the same paragraph in the new text.
+  async function toggleTranslation() {
+    if (!chapterNeedsTranslation) return;
+    const wasPlaying = active && !paused;
+    const block = sentences.length ? blockIndexOfSentence(index) : -1;
+    if (active) stop();
+    nextChapterPrefetch = null;
+    showingTranslation = !showingTranslation;
+    await renderChapterContent();
+    updateTranslateBtn();
+    if (block >= 0) {
+      sentences = wrapContentSentences(document.querySelector('article'));
+      index = Math.min(firstSentenceInBlock(block), Math.max(sentences.length - 1, 0));
+      highlightSentence(index);
+      updateProgress();
+    } else {
+      sentences = [];
+      index = 0;
+    }
+    if (wasPlaying) start();
   }
 
   // Resolves bookId/bookTitle/totalChapters/currentChapterNum from the
@@ -635,7 +754,11 @@
       // starting a fresh fetch here — keeps the upcoming .play() close to
       // the previous sentence's `ended` event, same reason as the prefetch
       // itself (see nextChapterPrefetch comment near the top of the file).
-      if (prefetched && prefetched.audioPromise) {
+      // Only if it was synthesized from the exact sentence about to be read
+      // — e.g. the translate setting may have changed since the prefetch.
+      if (prefetched && prefetched.audioPromise && prefetched.firstSentence !== sentences[0]) {
+        prefetched.audioPromise.then((url) => URL.revokeObjectURL(url)).catch(() => {});
+      } else if (prefetched && prefetched.audioPromise) {
         preloadCache[0] = prefetched.audioPromise
           .then((url) => {
             preloadReady.add(0);
@@ -867,6 +990,7 @@
         <span data-role="progress">0 / 0</span>
         <span class="reader-preload" data-role="preload" title="Số câu đã tải trước">0 / 0</span>
       </span>
+      <button class="reader-btn reader-btn-ghost" data-role="translateToggle" title="Dịch Hán Việt" hidden>文</button>
       <button class="reader-btn reader-btn-ghost" data-role="settingsToggle" title="Cài đặt đọc">⚙</button>
     `;
 
@@ -912,6 +1036,17 @@
           <option value="1.5">Cực lớn</option>
         </select>
       </label>
+      <div class="reader-settings-heading">Dịch</div>
+      <label>Công cụ dịch
+        <select data-role="translateEngine">
+          ${Object.entries(TRANSLATION_ENGINES).map(([key, e]) => `<option value="${key}">${e.name}</option>`).join('')}
+        </select>
+      </label>
+      <label class="reader-settings-checkbox">
+        <input type="checkbox" data-role="autoTranslate">
+        Tự động dịch chương tiếng Trung
+      </label>
+      <div class="reader-settings-heading">Tự động</div>
       <label class="reader-settings-checkbox">
         <input type="checkbox" data-role="autoNext">
         Tự động sang chương tiếp khi đọc xong
@@ -929,11 +1064,14 @@
       progress: bar.querySelector('[data-role="progress"]'),
       preload: bar.querySelector('[data-role="preload"]'),
       settingsToggle: bar.querySelector('[data-role="settingsToggle"]'),
+      translateToggle: bar.querySelector('[data-role="translateToggle"]'),
       errorBox: panel.querySelector('[data-role="errorBox"]'),
       panel,
       model: panel.querySelector('[data-role="model"]'),
       speed: panel.querySelector('[data-role="speed"]'),
       fontSize: panel.querySelector('[data-role="fontSize"]'),
+      translateEngine: panel.querySelector('[data-role="translateEngine"]'),
+      autoTranslate: panel.querySelector('[data-role="autoTranslate"]'),
       autoNext: panel.querySelector('[data-role="autoNext"]'),
       autoStopMinutes: panel.querySelector('[data-role="autoStopMinutes"]'),
       piperOfflineBox: panel.querySelector('[data-role="piperOfflineBox"]'),
@@ -974,6 +1112,29 @@
       localStorage.setItem('reader.fontSize', els.fontSize.value);
       applyFontScale();
     });
+
+    els.translateEngine.value = TRANSLATION_ENGINES[localStorage.getItem('reader.translateEngine')]
+      ? localStorage.getItem('reader.translateEngine')
+      : 'vietphrase';
+    els.translateEngine.addEventListener('change', async () => {
+      localStorage.setItem('reader.translateEngine', els.translateEngine.value);
+      // Re-translate whatever's showing with the newly selected engine.
+      if (showingTranslation) {
+        showingTranslation = false;
+        await toggleTranslation();
+      }
+    });
+
+    // Applied to the open chapter right away, same as the app's toggle.
+    els.autoTranslate.checked = autoTranslateOn();
+    els.autoTranslate.addEventListener('change', () => {
+      localStorage.setItem('reader.autoTranslate', els.autoTranslate.checked ? '1' : '0');
+      nextChapterPrefetch = null; // its first sentence was picked under the old setting
+      if (chapterNeedsTranslation && showingTranslation !== els.autoTranslate.checked) toggleTranslation();
+    });
+
+    els.translateToggle.addEventListener('click', () => toggleTranslation());
+    updateTranslateBtn();
 
     els.autoNext.checked = localStorage.getItem('reader.autoNext') === '1';
     els.autoNext.addEventListener('change', () => {

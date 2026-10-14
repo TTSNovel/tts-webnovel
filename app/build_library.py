@@ -293,6 +293,10 @@ def build_library(inputs: list[str], output_dir: str) -> None:
     site_assets = Path(__file__).resolve().parent.parent / "site_assets"
     shutil.copy(site_assets / "reader.js", assets_dir / "reader.js")
     shutil.copy(site_assets / "download.js", assets_dir / "download.js")
+    shutil.copy(site_assets / "hanviet.js", assets_dir / "hanviet.js")
+    # hanviet.js's dictionary — the same table tools/hanviet.py reads, kept
+    # in one place rather than duplicated under site_assets/.
+    shutil.copy(site_assets.parent / "tools" / "data" / "phienam.txt", assets_dir / "phienam.txt")
     _write_piper_offline_js(site_assets, assets_dir)
     shutil.copy(site_assets / "version-check.js", assets_dir / "version-check.js")
     shutil.copy(site_assets / "manifest.json", out / "manifest.json")
