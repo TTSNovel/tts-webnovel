@@ -24,6 +24,7 @@ from pathlib import Path
 import requests
 from flask import Flask, Response, abort, redirect, request, send_from_directory, session
 
+import translation
 from book_renderer import _CSS
 from build_library import _LEGACY_EXTENSIONS, add_book_to_site, write_index
 
@@ -359,6 +360,60 @@ def filter_words_update():
     }
     _save_filter_words(SITE_DIR, data)
     return data
+
+
+_LANG_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$")
+
+
+# Google Cloud Translation (v3) behind the login, same reasoning as
+# /api/tts: the service account's credentials stay server-side. Results are
+# stored per chapter on the site bucket (see translation.py) and shared by
+# the web reader and the iOS/macOS app — clients send a chapter's segments
+# in whatever chunks they like and only the not-yet-stored ones cost
+# anything.
+@app.route("/api/translate", methods=["POST"])
+@require_auth
+def translate_api():
+    body = request.get_json(force=True, silent=True) or {}
+    book_id = body.get("book_id")
+    chapter = body.get("chapter")
+    texts = body.get("texts")
+    source = body.get("source") or "en"
+    target = body.get("target") or "vi"
+    if (
+        not isinstance(book_id, int)
+        or not isinstance(chapter, int)
+        or not isinstance(texts, list)
+        or not all(isinstance(t, str) for t in texts)
+        or not _LANG_RE.match(source)
+        or not _LANG_RE.match(target)
+    ):
+        abort(400)
+    if (
+        len(texts) > translation.MAX_SEGMENTS_PER_REQUEST
+        or sum(len(t) for t in texts) > translation.MAX_CHARS_PER_REQUEST
+    ):
+        return Response("Too many segments in one request", 413)
+    try:
+        translations, stats = translation.translate_segments(SITE_DIR, book_id, chapter, texts, source, target)
+    except translation.TranslationError as e:
+        app.logger.error("translate failed: %s", e)
+        return Response(str(e), 502)
+    return {"translations": translations, **stats}
+
+
+@app.route("/api/translations/<int:book_id>", methods=["GET"])
+@require_auth
+def translations_list(book_id):
+    return {"book_id": book_id, "chapters": translation.list_stored(SITE_DIR, book_id)}
+
+
+# ?chapter=<n> clears just that chapter; otherwise the whole book.
+@app.route("/api/translations/<int:book_id>", methods=["DELETE"])
+@require_auth
+def translations_delete(book_id):
+    chapter = request.args.get("chapter", type=int)
+    return {"removed": translation.delete_stored(SITE_DIR, book_id, chapter)}
 
 
 def _bug_reports_dir(site_dir):

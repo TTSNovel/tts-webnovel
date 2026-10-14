@@ -257,6 +257,7 @@
         if (!r.ok) throw new Error(`fetch chapter failed: ${r.status}`);
         return r.text();
       })
+      .then((html) => maybeTranslateHtml(html, nextNum))
       .then((html) => {
         entry.html = html;
         const firstSentence = firstSentenceOf(html);
@@ -495,6 +496,91 @@
     });
   }
 
+  // ── Translation (Google Cloud Translation v3 via /api/translate) ──────────
+  // Opt-in ("Dịch sang tiếng Việt" in ⚙). A chapter fragment is translated
+  // paragraph by paragraph BEFORE it's injected into <article>, so sentence
+  // wrapping, TTS and highlighting all just run on the Vietnamese text as if
+  // it were the original. The server stores every translated paragraph
+  // (shared with the iOS/macOS app) and applies the book's glossary, so a
+  // re-read chapter comes straight back from storage.
+  const TRANSLATE_TARGET = 'vi';
+  const TRANSLATE_CHUNK_SEGMENTS = 80;
+  const TRANSLATE_CHUNK_CHARS = 20000;
+  const VI_CHARS = /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/gi;
+
+  function translationEnabled() {
+    return localStorage.getItem('reader.translate') === '1';
+  }
+
+  // Source language of a chapter, or null when it's already Vietnamese —
+  // which is also what keeps an already-translated (e.g. prefetched)
+  // fragment from being sent again.
+  function detectSourceLanguage(text) {
+    const letters = (text.match(/\p{L}/gu) || []).length;
+    if (!letters) return null;
+    if ((text.match(VI_CHARS) || []).length / letters > 0.03) return null;
+    if ((text.match(/[一-鿿]/g) || []).length / letters > 0.3) return 'zh';
+    return 'en';
+  }
+
+  function translatableNodes(container) {
+    return Array.from(container.querySelectorAll('p, h1, h2, h3, h4, li')).filter(
+      (node) =>
+        node.dataset.readerSkip === undefined &&
+        !node.querySelector('p, h1, h2, h3, h4, li') &&
+        node.textContent.trim().length > 0
+    );
+  }
+
+  async function postTranslate(num, source, texts) {
+    const resp = await fetch('/api/translate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ book_id: parseInt(bookId, 10), chapter: num, source, target: TRANSLATE_TARGET, texts }),
+    });
+    if (!resp.ok) throw new Error(`translate failed: ${resp.status}`);
+    return (await resp.json()).translations;
+  }
+
+  // Returns the fragment translated, or unchanged when translation is off,
+  // the chapter is already Vietnamese, or the request fails (offline etc. —
+  // reading the original beats not reading at all).
+  async function maybeTranslateHtml(html, num) {
+    if (!translationEnabled()) return html;
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    const nodes = translatableNodes(tmp);
+    const texts = nodes.map((node) => node.textContent.replace(/\s+/g, ' ').trim());
+    const source = detectSourceLanguage(texts.join(' '));
+    if (!source) return html;
+
+    const chunks = [];
+    let current = [];
+    let chars = 0;
+    texts.forEach((text, i) => {
+      if (current.length && (current.length >= TRANSLATE_CHUNK_SEGMENTS || chars + text.length > TRANSLATE_CHUNK_CHARS)) {
+        chunks.push(current);
+        current = [];
+        chars = 0;
+      }
+      current.push(i);
+      chars += text.length;
+    });
+    if (current.length) chunks.push(current);
+
+    const t0 = performance.now();
+    try {
+      const results = await Promise.all(chunks.map((idxs) => postTranslate(num, source, idxs.map((i) => texts[i]))));
+      chunks.forEach((idxs, c) => idxs.forEach((i, k) => (nodes[i].textContent = results[c][k])));
+    } catch (e) {
+      console.error('reader.js: translation failed, showing original ::', (e && e.message) || e);
+      showReaderError('Không dịch được chương này — đang hiển thị bản gốc.', false);
+      return html;
+    }
+    console.log(`reader.js: translated ${texts.length} paragraphs (${source}→${TRANSLATE_TARGET}) in ${(performance.now() - t0).toFixed(0)}ms`);
+    return tmp.innerHTML;
+  }
+
   // Fetches a chapter's content fragment and injects it into <article> in
   // place — no navigation, so the audio-unlock state (and this whole
   // script's in-memory state) survives across chapters. Throws on failure;
@@ -505,6 +591,11 @@
       const resp = await fetch(`/books/${bookId}/data/${pad4(num)}.html`);
       if (!resp.ok) throw new Error(`fetch chapter failed: ${resp.status}`);
       html = await resp.text();
+    }
+    if (translationEnabled()) {
+      const article = document.querySelector('article');
+      if (!article.textContent.trim()) article.innerHTML = '<p data-reader-skip>Đang dịch chương…</p>';
+      html = await maybeTranslateHtml(html, num);
     }
     document.querySelector('article').innerHTML = html;
 
@@ -727,6 +818,28 @@
     if (wasActive) start();
   }
 
+  // Re-renders the current chapter in place (original ↔ translated) —
+  // keeps the reading position by sentence index, which is close enough
+  // since translation keeps paragraphs 1:1 even if sentence counts shift.
+  async function reloadCurrentChapter() {
+    const wasActive = active;
+    const keepIndex = index;
+    if (wasActive) stop();
+    nextChapterPrefetch = null; // prefetched in the other language
+    try {
+      await goToChapter(currentChapterNum);
+    } catch (err) {
+      return;
+    }
+    sentences = wrapContentSentences(document.querySelector('article'));
+    index = Math.min(keepIndex, Math.max(sentences.length - 1, 0));
+    if (sentences.length) {
+      highlightSentence(index);
+      updateProgress();
+    }
+    if (wasActive) start();
+  }
+
   // Delegated on `document` since the nav links' disabled state/handlers
   // need to keep working across every goToChapter() content swap.
   function setupChapterNavInterception() {
@@ -913,6 +1026,10 @@
         </select>
       </label>
       <label class="reader-settings-checkbox">
+        <input type="checkbox" data-role="translate">
+        Dịch sang tiếng Việt (Google Translate)
+      </label>
+      <label class="reader-settings-checkbox">
         <input type="checkbox" data-role="autoNext">
         Tự động sang chương tiếp khi đọc xong
       </label>
@@ -934,6 +1051,7 @@
       model: panel.querySelector('[data-role="model"]'),
       speed: panel.querySelector('[data-role="speed"]'),
       fontSize: panel.querySelector('[data-role="fontSize"]'),
+      translate: panel.querySelector('[data-role="translate"]'),
       autoNext: panel.querySelector('[data-role="autoNext"]'),
       autoStopMinutes: panel.querySelector('[data-role="autoStopMinutes"]'),
       piperOfflineBox: panel.querySelector('[data-role="piperOfflineBox"]'),
@@ -973,6 +1091,13 @@
     els.fontSize.addEventListener('change', () => {
       localStorage.setItem('reader.fontSize', els.fontSize.value);
       applyFontScale();
+    });
+
+    els.translate.checked = translationEnabled();
+    els.translate.addEventListener('change', () => {
+      localStorage.setItem('reader.translate', els.translate.checked ? '1' : '0');
+      els.errorBox.hidden = true;
+      reloadCurrentChapter();
     });
 
     els.autoNext.checked = localStorage.getItem('reader.autoNext') === '1';
