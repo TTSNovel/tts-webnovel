@@ -299,6 +299,7 @@ def build_library(inputs: list[str], output_dir: str) -> None:
     shutil.copy(site_assets.parent / "tools" / "data" / "phienam.txt", assets_dir / "phienam.txt")
     _write_piper_offline_js(site_assets, assets_dir)
     shutil.copy(site_assets / "version-check.js", assets_dir / "version-check.js")
+    shutil.copy(site_assets / "progress.js", assets_dir / "progress.js")
     shutil.copy(site_assets / "manifest.json", out / "manifest.json")
     shutil.copy(site_assets / "sw.js", out / "sw.js")
     shutil.copytree(site_assets / "icons", assets_dir / "icons", dirs_exist_ok=True)

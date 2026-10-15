@@ -1,0 +1,89 @@
+# Push to main → pytest, then roll novel-web onto a fresh image and push the
+# static site assets (reader.js, sw.js, …) onto the GCS bucket it mounts.
+#
+# Book content (books/, index.html, books.json, progress.json, …) is never
+# touched here — it lives only on the bucket, written by /import and
+# build_library.py bulk loads.
+#
+# Auth is keyless (Workload Identity Federation, tts-pipeline-infra's
+# environments/dev/ci.tf). Repo variables: GCP_PROJECT_ID, GCP_WIF_PROVIDER,
+# GCP_DEPLOYER_SA, PIPER_MODEL_BASE_URL.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: asia-southeast1
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: asia-southeast1-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/tts-pipeline/novel-web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push image
+        run: |
+          gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+          docker build -t "$IMAGE:$GITHUB_SHA" -t "$IMAGE:latest" .
+          docker push --all-tags "$IMAGE"
+
+      - name: Roll Cloud Run
+        run: gcloud run deploy novel-web --project="$PROJECT_ID" --region="$REGION" --image="$IMAGE:$GITHUB_SHA"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      # build_library.py with an empty input dir writes just the shared
+      # assets/app shell; only those files are uploaded (its empty
+      # index.html/books.json are left behind on the runner).
+      - name: Build static assets
+        env:
+          PIPER_MODEL_BASE_URL: ${{ vars.PIPER_MODEL_BASE_URL }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/no-books"
+          python app/build_library.py -o "$RUNNER_TEMP/site" "$RUNNER_TEMP/no-books"
+          version="$(date -u +%Y%m%d-%H%M%S)"
+          sed -i "s/__DEPLOY_VERSION__/$version/g" \
+            "$RUNNER_TEMP/site/sw.js" "$RUNNER_TEMP/site/assets/reader.js" "$RUNNER_TEMP/site/assets/download.js"
+          echo "Stamped deploy version $version"
+
+      - name: Upload static assets
+        run: |
+          bucket="gs://${PROJECT_ID}-novel-web-site"
+          gcloud storage rsync --recursive "$RUNNER_TEMP/site/assets" "$bucket/assets"
+          gcloud storage cp "$RUNNER_TEMP/site/sw.js" "$RUNNER_TEMP/site/manifest.json" \
+            "$RUNNER_TEMP/site/chapter-shell.html" "$bucket/"
