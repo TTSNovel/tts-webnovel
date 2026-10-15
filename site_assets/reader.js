@@ -661,6 +661,198 @@
     },
   };
 
+  // ── Glossary editor (Google engine) ────────────────────────────────────────
+  // One shared term list for every book plus terms of just this book, edited
+  // as a whole and saved through /api/glossary — the server publishes it to
+  // Google (a few seconds), and already-translated chapters re-translate
+  // lazily against the new glossary. A blank translation keeps the term as is.
+  const GLOSSARY_CSS = `
+.glossary-overlay { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; padding: 16px; }
+.glossary-overlay[hidden] { display: none; }
+.glossary-box { width: min(640px, 100%); max-height: min(86vh, 900px); display: flex; flex-direction: column; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.glossary-head { display: flex; align-items: center; gap: .5rem; padding: .7rem .9rem; border-bottom: 1px solid var(--border); }
+.glossary-head h2 { flex: 1; margin: 0; font-size: 1rem; }
+.glossary-tabs { display: flex; gap: .4rem; padding: .6rem .9rem 0; }
+.glossary-tabs button { flex: 1; padding: .4rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font-size: .8rem; cursor: pointer; }
+.glossary-tabs button.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.glossary-tools { display: flex; gap: .4rem; padding: .6rem .9rem; }
+.glossary-tools input { flex: 1; min-width: 0; }
+.glossary-list { flex: 1; overflow-y: auto; padding: 0 .9rem; }
+.glossary-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: .4rem; margin-bottom: .4rem; }
+.glossary-box input { padding: .45rem .55rem; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); font-size: .85rem; min-width: 0; }
+.glossary-box .icon-btn { border: none; background: none; color: var(--muted); font-size: 1rem; cursor: pointer; padding: 0 .3rem; }
+.glossary-empty { color: var(--muted); font-size: .85rem; padding: .5rem 0 1rem; }
+.glossary-foot { display: flex; align-items: center; gap: .6rem; padding: .7rem .9rem; border-top: 1px solid var(--border); }
+.glossary-foot .status { flex: 1; font-size: .78rem; color: var(--muted); }
+.glossary-foot .status.err { color: #ef4444; }
+.glossary-btn { padding: .45rem .9rem; border: none; border-radius: 8px; background: var(--accent); color: var(--accent-text); font-weight: 600; font-size: .85rem; cursor: pointer; }
+.glossary-btn.ghost { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+.glossary-btn:disabled { opacity: .5; cursor: default; }
+`;
+
+  const glossary = { terms: [], scope: 'book', filter: '', dirty: false, loaded: false, el: null };
+
+  function buildGlossaryEditor() {
+    const style = document.createElement('style');
+    style.textContent = GLOSSARY_CSS;
+    document.head.appendChild(style);
+    const overlay = document.createElement('div');
+    overlay.className = 'glossary-overlay';
+    overlay.hidden = true;
+    overlay.innerHTML = `
+      <div class="glossary-box" role="dialog" aria-label="Glossary">
+        <div class="glossary-head"><h2>Glossary</h2><button class="icon-btn" data-g="close" title="Đóng">✕</button></div>
+        <div class="glossary-tabs">
+          <button data-g="tab" data-scope="book"></button>
+          <button data-g="tab" data-scope="shared"></button>
+        </div>
+        <div class="glossary-tools">
+          <input type="search" data-g="filter" placeholder="Tìm thuật ngữ…">
+          <button class="glossary-btn ghost" data-g="add">+ Thêm</button>
+        </div>
+        <div class="glossary-list" data-g="list"></div>
+        <div class="glossary-foot">
+          <span class="status" data-g="status">Để trống bản dịch = giữ nguyên từ gốc.</span>
+          <button class="glossary-btn" data-g="save">Lưu</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const q = (name) => overlay.querySelector(`[data-g="${name}"]`);
+    glossary.el = { overlay, list: q('list'), status: q('status'), save: q('save'), filter: q('filter') };
+
+    q('close').addEventListener('click', closeGlossaryEditor);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) closeGlossaryEditor();
+    });
+    overlay.querySelectorAll('[data-g="tab"]').forEach((btn) =>
+      btn.addEventListener('click', () => {
+        glossary.scope = btn.dataset.scope;
+        renderGlossary();
+      })
+    );
+    glossary.el.filter.addEventListener('input', () => {
+      glossary.filter = glossary.el.filter.value.trim().toLowerCase();
+      renderGlossary();
+    });
+    q('add').addEventListener('click', () => {
+      glossary.terms.unshift({ id: null, source: '', target: '', book_id: glossaryScopeBookId() });
+      glossary.filter = '';
+      glossary.el.filter.value = '';
+      markGlossaryDirty();
+      renderGlossary();
+      glossary.el.list.querySelector('input')?.focus();
+    });
+    glossary.el.save.addEventListener('click', saveGlossary);
+    // Inputs are re-rendered on tab/filter changes, so edits are read back
+    // from the event target instead of holding per-row listeners.
+    glossary.el.list.addEventListener('input', (e) => {
+      const row = e.target.closest('[data-i]');
+      if (!row) return;
+      glossary.terms[row.dataset.i][e.target.dataset.field] = e.target.value;
+      markGlossaryDirty();
+    });
+    glossary.el.list.addEventListener('click', (e) => {
+      const row = e.target.closest('[data-i]');
+      if (!row || e.target.dataset.g !== 'remove') return;
+      glossary.terms.splice(parseInt(row.dataset.i, 10), 1);
+      markGlossaryDirty();
+      renderGlossary();
+    });
+  }
+
+  function glossaryScopeBookId() {
+    return glossary.scope === 'book' ? parseInt(bookId, 10) : null;
+  }
+
+  function markGlossaryDirty() {
+    glossary.dirty = true;
+    setGlossaryStatus('Chưa lưu thay đổi.');
+  }
+
+  function setGlossaryStatus(text, isError) {
+    glossary.el.status.textContent = text;
+    glossary.el.status.classList.toggle('err', !!isError);
+  }
+
+  function renderGlossary() {
+    const { overlay, list } = glossary.el;
+    overlay.querySelectorAll('[data-g="tab"]').forEach((btn) => {
+      const scopeId = btn.dataset.scope === 'book' ? parseInt(bookId, 10) : null;
+      const n = glossary.terms.filter((t) => t.book_id === scopeId).length;
+      btn.textContent = `${btn.dataset.scope === 'book' ? 'Riêng truyện này' : 'Chung (mọi truyện)'} (${n})`;
+      btn.classList.toggle('on', btn.dataset.scope === glossary.scope);
+    });
+    const scopeId = glossaryScopeBookId();
+    const rows = [];
+    glossary.terms.forEach((t, i) => {
+      if (t.book_id !== scopeId) return;
+      if (glossary.filter && !`${t.source} ${t.target}`.toLowerCase().includes(glossary.filter)) return;
+      rows.push(`<div class="glossary-row" data-i="${i}">
+        <input data-field="source" value="${escapeAttr(t.source)}" placeholder="Thuật ngữ gốc (VD: Dao)">
+        <input data-field="target" value="${escapeAttr(t.target === t.source ? '' : t.target)}" placeholder="${escapeAttr(t.source) || 'Bản dịch'} (giữ nguyên)">
+        <button class="icon-btn" data-g="remove" title="Xoá">✕</button>
+      </div>`);
+    });
+    list.innerHTML = rows.length
+      ? rows.join('')
+      : `<div class="glossary-empty">${glossary.loaded ? 'Chưa có thuật ngữ nào.' : 'Đang tải…'}</div>`;
+  }
+
+  function escapeAttr(str) {
+    return escapeHtml(str || '').replace(/"/g, '&quot;');
+  }
+
+  async function openGlossaryEditor() {
+    if (!glossary.el) buildGlossaryEditor();
+    glossary.el.overlay.hidden = false;
+    if (glossary.dirty) return renderGlossary(); // keep unsaved edits from last time
+    glossary.loaded = false;
+    renderGlossary();
+    try {
+      const resp = await fetch('/api/glossary');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      glossary.terms = (await resp.json()).terms;
+      glossary.loaded = true;
+      setGlossaryStatus('Để trống bản dịch = giữ nguyên từ gốc.');
+    } catch (e) {
+      setGlossaryStatus(`Không tải được glossary: ${(e && e.message) || e}`, true);
+    }
+    renderGlossary();
+  }
+
+  function closeGlossaryEditor() {
+    glossary.el.overlay.hidden = true;
+  }
+
+  async function saveGlossary() {
+    const terms = glossary.terms.filter((t) => t.source.trim());
+    glossary.el.save.disabled = true;
+    setGlossaryStatus('Đang lưu và cập nhật lên Google…');
+    try {
+      const resp = await fetch('/api/glossary', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ terms }),
+      });
+      if (!resp.ok) throw new Error((await resp.text()) || `HTTP ${resp.status}`);
+      glossary.terms = (await resp.json()).terms;
+      glossary.dirty = false;
+      setGlossaryStatus('Đã lưu. Chương đang mở được dịch lại.');
+      renderGlossary();
+      // The open chapter re-translates against the new glossary (the server
+      // treats segments stored under the old one as missing).
+      if (showingTranslation && localStorage.getItem('reader.translateEngine') === 'google') {
+        chapterTranslatedHtml = null;
+        rerenderChapter(true);
+      }
+      nextChapterPrefetch = null;
+    } catch (e) {
+      setGlossaryStatus(`Lưu thất bại: ${(e && e.message) || e}`, true);
+    } finally {
+      glossary.el.save.disabled = false;
+    }
+  }
+
   // `html` translated by the current engine, or null if the chapter
   // doesn't need it. Throws if the engine fails.
   async function translateHtml(html, num) {
@@ -1161,6 +1353,7 @@
           ${Object.entries(TRANSLATION_ENGINES).map(([key, e]) => `<option value="${key}">${e.name}</option>`).join('')}
         </select>
       </label>
+      <button type="button" class="dl-btn" data-role="glossaryOpen" title="Thuật ngữ cố định khi dịch bằng Google Translate">Glossary (Google Translate)…</button>
       <label class="reader-settings-checkbox">
         <input type="checkbox" data-role="autoTranslate">
         Tự động dịch chương không phải tiếng Việt
@@ -1251,6 +1444,11 @@
       localStorage.setItem('reader.autoTranslate', els.autoTranslate.checked ? '1' : '0');
       nextChapterPrefetch = null; // its first sentence was picked under the old setting
       if (chapterNeedsTranslation && showingTranslation !== els.autoTranslate.checked) toggleTranslation();
+    });
+
+    panel.querySelector('[data-role="glossaryOpen"]').addEventListener('click', (e) => {
+      e.stopPropagation();
+      openGlossaryEditor();
     });
 
     els.translateToggle.addEventListener('click', () => toggleTranslation());

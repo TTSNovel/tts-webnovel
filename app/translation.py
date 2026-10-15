@@ -1,12 +1,22 @@
-"""Google Cloud Translation (v3) with per-book glossaries, plus a per-chapter
+"""Google Cloud Translation (v3) with a shared glossary, plus a per-chapter
 translation store on the site bucket so a sentence is only ever paid for
 once — both the web reader and the iOS/macOS app go through /api/translate
 (server.py) and share whatever the other already translated.
 
 Store layout (under SITE_DIR, i.e. the GCS bucket mounted into Cloud Run):
 
-  translations/glossaries/<book_id>.<src>-<tgt>.tsv   glossary source of truth
+  translations/glossary.json                          the glossary (edited via /api/glossary)
+  translations/glossaries/<glossary id>.tsv           what's published to Google
   translations/<book_id>/<src>-<tgt>/<chapter>.json   translated segments
+
+Glossary: one list of terms that applies to every book, plus optional terms
+of a single book (e.g. "class" → "chức nghiệp" is right for a LitRPG, wrong
+elsewhere). Google takes exactly one glossary per translate call, so what's
+published is, per source language, a global glossary with the shared terms
+and — for each book that has terms of its own — a book glossary with the
+shared terms + the book's (the book's win). A book uses its own glossary
+if it has one, else the global one. A term's source language is inferred
+from its text (CJK → zh, otherwise en); the target is always Vietnamese.
 
 A chapter file maps sha256(source segment) -> {"t": translation, "g":
 glossary revision}. Keyed by the segment's own text rather than its
@@ -14,15 +24,19 @@ position, so it doesn't matter how a client splits a chapter (the app sends
 TTS-sized sentences, the web reader sends whole paragraphs) or in what
 order/chunks it asks — every request just fills in whatever's missing, and
 a chapter can be partially translated for as long as nobody reads the rest.
-An entry whose "g" doesn't match the book's current glossary revision is
-treated as missing, so re-pushing a glossary (tools/glossary.py push)
-re-translates lazily on next read instead of needing a cache purge.
+An entry whose "g" doesn't match the current glossary revision (the Google
+glossary's submitTime, new on every publish) is treated as missing, so
+editing the glossary re-translates lazily on next read instead of needing a
+cache purge.
 """
 import hashlib
 import json
+import os
 import re
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -65,8 +79,20 @@ class TranslationError(Exception):
     pass
 
 
-def glossary_id(book_id, source, target):
-    return f"novel-book-{book_id}-{source}-{target}".lower()
+GLOSSARY_TARGET = "vi"
+MAX_GLOSSARY_TERMS = 5000
+MAX_TERM_CHARS = 200
+_CJK = re.compile(r"[㐀-鿿豈-﫿]")
+
+
+def glossary_id(book_id, source, target=GLOSSARY_TARGET):
+    """Google glossary id — a book's own, or the global one (book_id None)."""
+    scope = "global" if book_id is None else f"book-{book_id}"
+    return f"novel-{scope}-{source}-{target}".lower()
+
+
+def term_language(text):
+    return "zh" if _CJK.search(text) else "en"
 
 
 def segment_key(text):
@@ -99,12 +125,10 @@ def _parent(project):
     return f"projects/{project}/locations/{GLOSSARY_LOCATION}"
 
 
-def glossary_revision(book_id, source, target):
-    """The book's glossary revision — the Google glossary's submitTime,
-    which changes every time tools/glossary.py re-creates it — or None if
-    the book has no glossary. Cached briefly — this is checked on every
-    /api/translate call."""
-    gid = glossary_id(book_id, source, target)
+def _published_revision(gid):
+    """A Google glossary's submitTime (new on every publish), or None if it
+    doesn't exist. Cached briefly — looked up on every /api/translate call;
+    publish() clears the cache on the instance that published."""
     cached = _glossary_cache.get(gid)
     if cached and time.time() - cached[0] < _GLOSSARY_TTL_SECONDS:
         return cached[1]
@@ -118,6 +142,211 @@ def glossary_revision(book_id, source, target):
         raise TranslationError(f"glossary lookup failed: {resp.status_code} {resp.text[:200]}")
     _glossary_cache[gid] = (time.time(), revision)
     return revision
+
+
+def resolve_glossary(book_id, source, target):
+    """(glossary id, revision) to translate `book_id` with — its own
+    glossary if it has one, else the global one — or (None, None)."""
+    if target != GLOSSARY_TARGET:
+        return None, None
+    for gid in (glossary_id(book_id, source), glossary_id(None, source)):
+        revision = _published_revision(gid)
+        if revision:
+            return gid, revision
+    return None, None
+
+
+# ── Glossary storage + publishing ───────────────────────────────────────────
+
+
+def _glossary_path(site_dir):
+    return Path(site_dir) / "translations" / "glossary.json"
+
+
+def load_glossary(site_dir):
+    path = _glossary_path(site_dir)
+    if not path.exists():
+        return {"terms": [], "updated_at": "1970-01-01T00:00:00.000Z", "published": {}}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _clean_term_text(value):
+    if not isinstance(value, str):
+        raise ValueError("term text must be a string")
+    text = re.sub(r"\s+", " ", value).strip()
+    if not text or len(text) > MAX_TERM_CHARS:
+        raise ValueError(f"term text must be 1–{MAX_TERM_CHARS} characters")
+    return text
+
+
+def normalize_terms(raw_terms):
+    """Validated copy of a client-submitted term list: trimmed text, an id
+    on every term, and one term per (book, source text) — the last wins. A
+    blank target means "keep as is" (e.g. "class" stays "class"), stored as
+    the source text itself, which is how Google's glossary expresses it."""
+    if not isinstance(raw_terms, list) or len(raw_terms) > MAX_GLOSSARY_TERMS:
+        raise ValueError("terms must be a list of at most %d items" % MAX_GLOSSARY_TERMS)
+    by_key = {}
+    for raw in raw_terms:
+        if not isinstance(raw, dict):
+            raise ValueError("each term must be an object")
+        book_id = raw.get("book_id")
+        if book_id is not None and (not isinstance(book_id, int) or isinstance(book_id, bool)):
+            raise ValueError("book_id must be an integer or null")
+        source = _clean_term_text(raw.get("source"))
+        target = raw.get("target")
+        term = {
+            "id": raw.get("id") if isinstance(raw.get("id"), str) and raw.get("id") else str(uuid.uuid4()),
+            "source": source,
+            "target": source if target is None or (isinstance(target, str) and not target.strip()) else _clean_term_text(target),
+            "book_id": book_id,
+        }
+        by_key.pop((book_id, term["source"]), None)  # re-insert so order follows the last occurrence
+        by_key[(book_id, term["source"])] = term
+    return list(by_key.values())
+
+
+def glossary_contents(terms):
+    """{glossary id: TSV text} that should be published for `terms`."""
+    shared = {}  # lang -> {source: target}
+    per_book = {}  # (book_id, lang) -> {source: target}
+    for term in terms:
+        lang = term_language(term["source"])
+        if term["book_id"] is None:
+            shared.setdefault(lang, {})[term["source"]] = term["target"]
+        else:
+            per_book.setdefault((term["book_id"], lang), {})[term["source"]] = term["target"]
+
+    def tsv(entries):
+        return "".join(f"{s}\t{t}\n" for s, t in sorted(entries.items()))
+
+    contents = {glossary_id(None, lang): tsv(entries) for lang, entries in shared.items()}
+    for (book_id, lang), entries in per_book.items():
+        contents[glossary_id(book_id, lang)] = tsv({**shared.get(lang, {}), **entries})
+    return contents
+
+
+def _content_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _wait_for(op_name, headers, timeout=180):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        op = requests.get(f"{_API}/{op_name}", headers=headers, timeout=30).json()
+        if op.get("done"):
+            if "error" in op:
+                raise TranslationError(f"{op_name} failed: {op['error']}")
+            return
+        time.sleep(1)
+    raise TranslationError(f"{op_name} timed out")
+
+
+class GoogleGlossaries:
+    """The handful of Glossary API calls publish() needs."""
+
+    def __init__(self, site_dir):
+        self.site_dir = site_dir
+
+    def list_ids(self):
+        headers, project = _headers()
+        ids, page = [], None
+        while True:
+            params = {"pageSize": 1000, **({"pageToken": page} if page else {})}
+            resp = requests.get(f"{_API}/{_parent(project)}/glossaries", headers=headers, params=params, timeout=30)
+            if not resp.ok:
+                raise TranslationError(f"list glossaries failed: {resp.status_code} {resp.text[:200]}")
+            data = resp.json()
+            ids += [g["name"].rsplit("/", 1)[-1] for g in data.get("glossaries", [])]
+            page = data.get("nextPageToken")
+            if not page:
+                return [i for i in ids if i.startswith("novel-")]
+
+    def delete(self, gid):
+        headers, project = _headers()
+        resp = requests.delete(f"{_API}/{_parent(project)}/glossaries/{gid}", headers=headers, timeout=30)
+        if resp.status_code == 404:
+            return
+        if not resp.ok:
+            raise TranslationError(f"delete glossary {gid} failed: {resp.status_code} {resp.text[:200]}")
+        _wait_for(resp.json()["name"], headers)
+
+    def create(self, gid, tsv_text):
+        headers, project = _headers()
+        # Written through the bucket mount (SITE_DIR), which is where Google
+        # reads glossary input from.
+        rel = f"translations/glossaries/{gid}.tsv"
+        path = Path(self.site_dir) / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(tsv_text, encoding="utf-8")
+        bucket = os.environ.get("GLOSSARY_BUCKET") or f"{project}-novel-web-site"
+        source = gid.split("-")[-2]
+        body = {
+            "name": f"{_parent(project)}/glossaries/{gid}",
+            "languagePair": {"sourceLanguageCode": source, "targetLanguageCode": GLOSSARY_TARGET},
+            "inputConfig": {"gcsSource": {"inputUri": f"gs://{bucket}/{rel}"}},
+        }
+        resp = requests.post(f"{_API}/{_parent(project)}/glossaries", json=body, headers=headers, timeout=30)
+        if not resp.ok:
+            raise TranslationError(f"create glossary {gid} failed: {resp.status_code} {resp.text[:200]}")
+        _wait_for(resp.json()["name"], headers)
+
+
+_publish_lock = threading.Lock()
+
+
+def save_glossary(site_dir, raw_terms, google=None):
+    """Stores the edited term list and publishes it to Google. Returns the
+    stored glossary plus {"updated": [...], "deleted": [...]} glossary ids.
+    Raises ValueError for an invalid list (nothing stored) and
+    TranslationError if publishing failed (the list itself is stored; the
+    next save retries publishing whatever's still out of date)."""
+    terms = normalize_terms(raw_terms)
+    with _publish_lock:
+        data = load_glossary(site_dir)
+        data["terms"] = terms
+        data["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        path = _glossary_path(site_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        try:
+            changes = _publish(site_dir, data, google or GoogleGlossaries(site_dir))
+        finally:
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    return data, changes
+
+
+def _publish(site_dir, data, google):
+    desired = glossary_contents(data["terms"])
+    published = data.setdefault("published", {})
+    existing = set(google.list_ids())
+    to_update = [gid for gid, text in desired.items() if gid not in existing or published.get(gid) != _content_hash(text)]
+    to_delete = sorted(existing - set(desired))
+
+    def update(gid):
+        if gid in existing:
+            google.delete(gid)
+        google.create(gid, desired[gid])
+        return gid
+
+    errors = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(update, gid) for gid in to_update] + [pool.submit(google.delete, gid) for gid in to_delete]
+        for future in futures:
+            try:
+                future.result()
+            except TranslationError as e:
+                errors.append(str(e))
+    for gid in to_update:
+        published[gid] = _content_hash(desired[gid])
+    for gid in to_delete:
+        published.pop(gid, None)
+    _glossary_cache.clear()
+    if errors:
+        # Forget hashes so the next save retries everything that may be stale.
+        data["published"] = {}
+        raise TranslationError("; ".join(errors))
+    return {"updated": sorted(to_update), "deleted": to_delete}
 
 
 def google_translate(texts, source, target, glossary=None):
@@ -159,14 +388,13 @@ def _load_chapter(path):
         return {"entries": {}}
 
 
-def translate_segments(site_dir, book_id, chapter, texts, source, target, translate_fn=None, revision_fn=None):
+def translate_segments(site_dir, book_id, chapter, texts, source, target, translate_fn=None, glossary_fn=None):
     """Translations for `texts` (aligned), serving whatever's already stored
     for this chapter and translating + storing only the rest. Returns
     (translations, {"cached": n, "translated": n, "glossary": revision})."""
     translate_fn = translate_fn or google_translate
-    revision_fn = revision_fn or glossary_revision
-    revision = revision_fn(book_id, source, target)
-    glossary = glossary_id(book_id, source, target) if revision else None
+    glossary_fn = glossary_fn or resolve_glossary
+    glossary, revision = glossary_fn(book_id, source, target)
     rev_tag = revision or ""
 
     path = _chapter_path(site_dir, book_id, chapter, source, target)
@@ -187,7 +415,16 @@ def translate_segments(site_dir, book_id, chapter, texts, source, target, transl
 
     if missing:
         keys = list(missing)
-        translated = translate_fn([missing[k] for k in keys], source, target, glossary)
+        try:
+            translated = translate_fn([missing[k] for k in keys], source, target, glossary)
+        except TranslationError:
+            if not glossary:
+                raise
+            # The glossary may be mid-republish (deleted, not yet re-created)
+            # — translate without it rather than fail. Stored with no
+            # revision, so it's redone with the glossary on a later read.
+            glossary, revision, rev_tag = None, None, ""
+            translated = translate_fn([missing[k] for k in keys], source, target, None)
         # Re-read right before writing: another request (e.g. the next chunk
         # of the same chapter) may have stored entries since we loaded.
         stored = _load_chapter(path)

@@ -416,6 +416,31 @@ def translations_delete(book_id):
     return {"removed": translation.delete_stored(SITE_DIR, book_id, chapter)}
 
 
+# The translation glossary (see translation.py): shared terms (book_id null)
+# plus book-specific ones, edited as a whole list from the web reader's and
+# the app's glossary screens. Saving also publishes it to Google, which takes
+# a few seconds per changed glossary.
+@app.route("/api/glossary", methods=["GET"])
+@require_auth
+def glossary_get():
+    data = translation.load_glossary(SITE_DIR)
+    return {"terms": data["terms"], "updated_at": data["updated_at"]}
+
+
+@app.route("/api/glossary", methods=["POST"])
+@require_auth
+def glossary_save():
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        data, changes = translation.save_glossary(SITE_DIR, body.get("terms"))
+    except ValueError as e:
+        return Response(str(e), 400)
+    except translation.TranslationError as e:
+        app.logger.error("glossary publish failed: %s", e)
+        return Response(f"Đã lưu glossary nhưng chưa cập nhật được lên Google: {e}", 502)
+    return {"terms": data["terms"], "updated_at": data["updated_at"], **changes}
+
+
 def _bug_reports_dir(site_dir):
     d = Path(site_dir) / "bug_reports"
     d.mkdir(parents=True, exist_ok=True)
