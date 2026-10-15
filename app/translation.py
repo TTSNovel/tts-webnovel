@@ -51,7 +51,11 @@ _SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 MAX_SEGMENTS_PER_REQUEST = 200
 MAX_CHARS_PER_REQUEST = 25000
 
-_GLOSSARY_TTL_SECONDS = 300
+# How long an instance trusts its last look at a glossary's revision. Kept
+# short because a save on one Cloud Run instance only clears that
+# instance's cache — others keep serving segments stored under the old
+# glossary until this runs out.
+_GLOSSARY_TTL_SECONDS = 30
 
 # Google's output sometimes has a stray space just inside quotes/brackets —
 # after an opener directly preceding a glossary term ("“ Thiên Đạo",
