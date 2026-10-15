@@ -296,6 +296,7 @@ article p { margin: 0 0 1.1em; font-size: 1.05em; }
 .reader-btn-ghost[hidden] { display: none; }
 .reader-btn-ghost.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 .reader-btn-ghost.busy { animation: reader-busy 1s ease-in-out infinite alternate; }
+.reader-btn-lang { font-size: .75rem; font-weight: 700; letter-spacing: .02em; }
 @keyframes reader-busy { from { opacity: 1; } to { opacity: .35; } }
 /* Narrower than the old horizontal layout's 4.5rem — that width had to fit
    next to the play/settings buttons in a single row, but stacked in a

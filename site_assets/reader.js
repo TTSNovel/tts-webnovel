@@ -894,7 +894,12 @@
     if (!els) return;
     els.translateToggle.hidden = !chapterNeedsTranslation;
     els.translateToggle.classList.toggle('on', showingTranslation);
-    els.translateToggle.title = showingTranslation ? 'Xem bản gốc' : 'Dịch chương';
+    // Like the app's translate pill: the source language's code while
+    // showing the original, the target's (VI) once showing the translation.
+    // VietPhrase only converts Chinese, so anything it flags reads as ZH.
+    const source = detectSourceLanguage(textOfHtml(chapterOriginalHtml)) || 'zh';
+    els.translateToggle.textContent = (showingTranslation ? TRANSLATE_TARGET : source).toUpperCase();
+    els.translateToggle.title = showingTranslation ? 'Xem bản gốc' : `Dịch sang ${TRANSLATE_TARGET.toUpperCase()}`;
   }
 
   // Index (into SENTENCE_BLOCKS) of the paragraph holding sentence `i` —
@@ -1301,7 +1306,7 @@
         <span data-role="progress">0 / 0</span>
         <span class="reader-preload" data-role="preload" title="Số câu đã tải trước">0 / 0</span>
       </span>
-      <button class="reader-btn reader-btn-ghost" data-role="translateToggle" title="Dịch chương" hidden>文</button>
+      <button class="reader-btn reader-btn-ghost reader-btn-lang" data-role="translateToggle" title="Dịch chương" hidden></button>
       <button class="reader-btn reader-btn-ghost" data-role="settingsToggle" title="Cài đặt đọc">⚙</button>
     `;
 
