@@ -17,6 +17,10 @@ and — for each book that has terms of its own — a book glossary with the
 shared terms + the book's (the book's win). A book uses its own glossary
 if it has one, else the global one. A term's source language is inferred
 from its text (CJK → zh, otherwise en); the target is always Vietnamese.
+Google only matches a glossary term exactly, so each English term is
+published along with its other spellings (see term_variants) — "Dao Seed"
+also covers "Dao Seeds", "class" also "Class"/"classes" — rather than
+making the user enter every form.
 
 A chapter file maps sha256(source segment) -> {"t": translation, "g":
 glossary revision}. Keyed by the segment's own text rather than its
@@ -97,6 +101,56 @@ def glossary_id(book_id, source, target=GLOSSARY_TARGET):
 
 def term_language(text):
     return "zh" if _CJK.search(text) else "en"
+
+
+_WORD_END = re.compile(r"[A-Za-z]+$")
+
+
+def _other_number(word):
+    """`word`'s plural, or its singular if it already looks plural."""
+    lower = word.lower()
+    if lower.endswith(("ss", "us", "is")):  # Class, Status, Axis: singular
+        return word + "es"
+    if lower.endswith("ies") and len(word) > 4:
+        return word[:-3] + "y"
+    if lower.endswith(("ches", "shes", "sses", "xes", "zes")):
+        return word[:-2]
+    if lower.endswith("s"):
+        return word[:-1]
+    if lower.endswith(("ch", "sh", "x", "z")):
+        return word + "es"
+    if lower.endswith("y") and len(word) > 1 and lower[-2] not in "aeiou":
+        return word[:-1] + "ies"
+    return word + "s"  # also for an acronym: "HP" → "HPs"
+
+
+def term_variants(source):
+    """The other spellings an English term also applies to: singular/plural
+    of its last word ("Dao Seed" ↔ "Dao Seeds", "Ability" ↔ "Abilities")
+    and, for each, the first letter capitalized ("class" → "Class", for the
+    start of a sentence). Not the other way round — matching stays
+    case-sensitive, "Strength" mustn't catch the ordinary word "strength" —
+    and not all-caps, which prose rarely uses. CJK terms have neither."""
+    if term_language(source) != "en":
+        return []
+    match = _WORD_END.search(source)
+    forms = [source]
+    if match and len(match.group()) > 1:
+        forms.append(source[:match.start()] + _other_number(match.group()))
+    forms += [f[0].upper() + f[1:] for f in forms if f[0].islower()]
+    return [f for f in dict.fromkeys(forms) if f != source]
+
+
+def _with_variants(entries):
+    """`entries` plus every term's variants, translated the same — except a
+    keep-original term's, which keep their own spelling ("Classes" stays
+    "Classes", not "class"). A term entered as such wins over another's
+    variant."""
+    expanded = {}
+    for source, target in sorted(entries.items()):
+        for variant in term_variants(source):
+            expanded.setdefault(variant, variant if target == source else target)
+    return {**expanded, **entries}
 
 
 def segment_key(text):
@@ -224,9 +278,9 @@ def glossary_contents(terms):
     def tsv(entries):
         return "".join(f"{s}\t{t}\n" for s, t in sorted(entries.items()))
 
-    contents = {glossary_id(None, lang): tsv(entries) for lang, entries in shared.items()}
+    contents = {glossary_id(None, lang): tsv(_with_variants(entries)) for lang, entries in shared.items()}
     for (book_id, lang), entries in per_book.items():
-        contents[glossary_id(book_id, lang)] = tsv({**shared.get(lang, {}), **entries})
+        contents[glossary_id(book_id, lang)] = tsv({**_with_variants(shared.get(lang, {})), **_with_variants(entries)})
     return contents
 
 
