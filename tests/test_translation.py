@@ -143,10 +143,41 @@ def test_glossary_contents_merges_shared_into_book_glossaries():
         {"source": "林动", "target": "Lâm Động", "book_id": 7},
     ])
     assert translation.glossary_contents(terms) == {
-        "novel-global-en-vi": "Dao\tĐạo\nclass\tlớp\n",
-        "novel-book-119-en-vi": "Dao\tĐạo\nclass\tchức nghiệp\n",
+        "novel-global-en-vi": "Class\tlớp\nClasses\tlớp\nDao\tĐạo\nDaos\tĐạo\nclass\tlớp\nclasses\tlớp\n",
+        "novel-book-119-en-vi": "Class\tchức nghiệp\nClasses\tchức nghiệp\nDao\tĐạo\nDaos\tĐạo\n"
+                                "class\tchức nghiệp\nclasses\tchức nghiệp\n",
         "novel-book-7-zh-vi": "林动\tLâm Động\n",
     }
+
+
+@pytest.mark.parametrize("source,variants", [
+    ("Dao Seed", ["Dao Seeds"]),
+    ("Dao Seeds", ["Dao Seed"]),
+    ("Ability", ["Abilities"]),
+    ("Abilities", ["Ability"]),
+    ("Day", ["Days"]),
+    ("Branch", ["Branches"]),
+    ("Boxes", ["Box"]),
+    ("Status", ["Statuses"]),
+    ("class", ["classes", "Class", "Classes"]),
+    ("Strength", ["Strengths"]),  # never "strength": matching stays case-sensitive
+    ("HP", ["HPs"]),
+    ("Fire Bolt!", []),
+    ("林动", []),
+])
+def test_term_variants(source, variants):
+    assert translation.term_variants(source) == variants
+
+
+def test_entered_term_wins_over_a_variant():
+    terms = translation.normalize_terms([
+        {"source": "Seed", "target": "Hạt Giống", "book_id": None},
+        {"source": "Seeds", "target": "Các Hạt", "book_id": None},
+        {"source": "class", "target": "", "book_id": None},  # keep original
+    ])
+    assert translation.glossary_contents(terms)["novel-global-en-vi"] == (
+        "Class\tClass\nClasses\tClasses\nSeed\tHạt Giống\nSeeds\tCác Hạt\nclass\tclass\nclasses\tclasses\n"
+    )
 
 
 class FakeGlossaries:
