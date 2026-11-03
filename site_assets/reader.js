@@ -143,33 +143,303 @@
     document.documentElement.style.setProperty('--reader-font-scale', localStorage.getItem('reader.fontSize') || '1');
   }
 
-  // Reading-history sync — GET once per page load (in parallel with the
-  // chapter fetch, see bootstrap()), POST at milestones (pause, chapter
-  // navigation, tab hidden, tab close) rather than every sentence. Same
-  // backend (/api/progress) and cadence as the iOS app, since progress is
-  // account-wide, not device-specific.
-  async function fetchProgress() {
+  // Reading-history sync (v2, see server's progress_log.py) — GET once per
+  // page load (in parallel with the chapter fetch, see bootstrap()) and
+  // again whenever the tab becomes visible. Writes are events, and ONLY for
+  // deliberate actions: picking a chapter (prev/next/keys/lock screen, or a
+  // chapter link on the book page — see takePendingSelect), auto-advance,
+  // and "đọc ở đây"/restore. Opening a page, reloading, switching tabs,
+  // pausing or closing never writes: re-announcing "where this tab is" is
+  // exactly how a stale Firefox tab on chapter 297 overwrote 441 on
+  // 2026-11-03. Each event carries the rev this tab last saw (base_rev); the
+  // server only applies it if that is still the latest, otherwise 409 and
+  // the user is asked here (showConflictBanner).
+  let progressRev = 0;
+  let progressLoaded = false;
+  let knownPosition = null;
+  // Events are sent one at a time so a quick "next, next" doesn't race two
+  // requests carrying the same base_rev (the second would be a false 409).
+  let progressQueue = Promise.resolve();
+
+  // Same key/format as progress.js (book pages) — one id per browser
+  // profile, so the history can tell this browser from the phone.
+  function deviceId() {
     try {
-      const r = await fetch('/api/progress');
-      if (!r.ok) return {};
-      return await r.json();
+      let id = localStorage.getItem('deviceId');
+      if (!id) {
+        id = newUuid();
+        localStorage.setItem('deviceId', id);
+      }
+      return id;
     } catch {
-      return {};
+      return null;
     }
   }
 
-  // `beacon: true` for the tab-hidden/page-unload cases — a plain fetch()
-  // started that late in a page's life isn't guaranteed to finish (or even
-  // start) before the page is actually torn down; sendBeacon is the
-  // browser-native "fire this even if the page is closing" primitive.
-  function postProgress(chapter, sentence, { beacon = false } = {}) {
-    if (!bookId) return;
-    const body = JSON.stringify({ book_id: parseInt(bookId, 10), chapter, sentence });
-    if (beacon && navigator.sendBeacon) {
-      navigator.sendBeacon('/api/progress', new Blob([body], { type: 'application/json' }));
+  function newUuid() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+    });
+  }
+
+  // "Firefox · Linux" — what the other devices' banners and the history
+  // show for this browser.
+  const UA_BROWSERS = [
+    ['Edg/', 'Edge'],
+    ['OPR/', 'Opera'],
+    ['Firefox/', 'Firefox'],
+    ['FxiOS/', 'Firefox'],
+    ['CriOS/', 'Chrome'],
+    ['Chrome/', 'Chrome'],
+    ['Safari/', 'Safari'],
+  ];
+  const UA_OSES = [
+    ['iPhone', 'iOS'],
+    ['iPad', 'iPadOS'],
+    ['Android', 'Android'],
+    ['CrOS', 'ChromeOS'],
+    ['Windows', 'Windows'],
+    ['Mac OS X', 'macOS'],
+    ['Linux', 'Linux'],
+  ];
+
+  function deviceName() {
+    const ua = navigator.userAgent;
+    const browser = UA_BROWSERS.find(([token]) => ua.includes(token))?.[1] || 'Trình duyệt';
+    const os = UA_OSES.find(([token]) => ua.includes(token))?.[1];
+    return os ? `${browser} · ${os}` : browser;
+  }
+
+  function progressHeaders(extra) {
+    const headers = { 'X-Device-Name': encodeURIComponent(deviceName()), ...extra };
+    const id = deviceId();
+    if (id) headers['X-Device-Id'] = id;
+    return headers;
+  }
+
+  // null on failure (offline, logged out) so callers can tell "no
+  // position" from "couldn't ask".
+  async function fetchProgress() {
+    try {
+      const r = await fetch('/api/progress', { headers: progressHeaders() });
+      if (!r.ok) return null;
+      return await r.json();
+    } catch {
+      return null;
+    }
+  }
+
+  function adoptPosition(position) {
+    knownPosition = position || null;
+    progressRev = position ? position.rev || 0 : 0;
+    progressLoaded = true;
+  }
+
+  // Queues a chapter event. `id` is fixed before the first attempt so a
+  // retry after a lost response is recognised by the server as the same
+  // event (it returns the original outcome instead of applying twice).
+  function postProgressEvent(chapter, kind, { id, baseRev } = {}) {
+    if (!bookId) return Promise.resolve(null);
+    const eventId = id || newUuid();
+    const clientTs = new Date().toISOString();
+    progressQueue = progressQueue.then(() => sendProgressEvent(eventId, chapter, kind, baseRev, clientTs));
+    return progressQueue;
+  }
+
+  async function sendProgressEvent(eventId, chapter, kind, baseRev, clientTs) {
+    // Never decide on rev 0 just because the page's own GET failed — that
+    // would turn every event into a 409 against an existing position.
+    if (!progressLoaded) {
+      const progress = await fetchProgress();
+      if (progress) adoptPosition(progress[bookId]);
+    }
+    const body = JSON.stringify({
+      id: eventId,
+      book_id: parseInt(bookId, 10),
+      chapter,
+      kind,
+      base_rev: baseRev ?? progressRev,
+      client_ts: clientTs,
+    });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await fetch('/api/progress/events', {
+          method: 'POST',
+          headers: progressHeaders({ 'Content-Type': 'application/json' }),
+          body,
+        });
+        if (r.status === 200) {
+          const result = await r.json();
+          adoptPosition(result.position);
+          hideProgressBanner();
+          return result;
+        }
+        if (r.status === 409) {
+          // base_rev is NOT updated here: ignoring the banner and moving on
+          // must ask again, not silently win the next time.
+          const result = await r.json();
+          showConflictBanner(result.position, chapter);
+          return result;
+        }
+        if (r.status >= 400 && r.status < 500) {
+          console.warn(`reader.js: progress event rejected (${r.status}) for chapter ${chapter}`);
+          return null;
+        }
+      } catch {
+        /* network — retried below with the same id */
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
+    }
+    console.warn(`reader.js: progress event for chapter ${chapter} not delivered`);
+    return null;
+  }
+
+  // A chapter link clicked on the book page (progress.js) is a real page
+  // navigation, so the intent travels in sessionStorage and is posted here
+  // — but only on a fresh navigation to exactly that chapter. A reload,
+  // back/forward or restored session lands on the same URL without anyone
+  // choosing it, and must never write.
+  const PENDING_SELECT_KEY = 'progress.pendingSelect';
+  const PENDING_SELECT_MAX_AGE_MS = 5 * 60 * 1000;
+
+  function takePendingSelect() {
+    let pending = null;
+    try {
+      pending = JSON.parse(sessionStorage.getItem(PENDING_SELECT_KEY) || 'null');
+      sessionStorage.removeItem(PENDING_SELECT_KEY);
+    } catch {
+      return null;
+    }
+    if (!pending || !bookId) return null;
+    const nav = performance.getEntriesByType && performance.getEntriesByType('navigation')[0];
+    if (!nav || nav.type !== 'navigate') return null;
+    if (String(pending.book_id) !== String(bookId) || pending.chapter !== currentChapterNum) return null;
+    if (!(Date.now() - pending.created_at < PENDING_SELECT_MAX_AGE_MS)) return null;
+    return pending;
+  }
+
+  // "18:52", plus "03/11" when it isn't today.
+  function formatPositionTime(iso) {
+    const d = new Date(iso);
+    if (isNaN(d)) return '';
+    const two = (n) => String(n).padStart(2, '0');
+    const time = `${two(d.getHours())}:${two(d.getMinutes())}`;
+    if (d.toDateString() === new Date().toDateString()) return time;
+    return `${time} ${two(d.getDate())}/${two(d.getMonth() + 1)}`;
+  }
+
+  let progressBanner = null;
+
+  function injectProgressBannerStyles() {
+    const style = document.createElement('style');
+    style.textContent = `
+      .progress-banner { position: fixed; left: 50%; bottom: calc(1rem + env(safe-area-inset-bottom)); transform: translateX(-50%);
+        width: min(92vw, 560px); z-index: 30; background: var(--surface); color: var(--text); border: 1px solid var(--border);
+        border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.18); padding: .75rem 2.2rem .75rem 1rem; font-size: .9rem; }
+      .progress-banner p { margin: 0 0 .5rem; }
+      .progress-banner .actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+      .progress-banner button { border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: 8px;
+        padding: .35rem .7rem; font-size: .85rem; cursor: pointer; }
+      .progress-banner button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+      .progress-banner .close { position: absolute; top: .35rem; right: .35rem; border: none; background: none; padding: .2rem .45rem; }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function hideProgressBanner() {
+    if (progressBanner) progressBanner.remove();
+    progressBanner = null;
+  }
+
+  // actions: [[label, handler, primary?], ...]
+  function showProgressBanner(message, actions) {
+    hideProgressBanner();
+    const box = document.createElement('div');
+    box.className = 'progress-banner';
+    box.setAttribute('role', 'status');
+    const p = document.createElement('p');
+    p.textContent = message;
+    const row = document.createElement('div');
+    row.className = 'actions';
+    actions.forEach(([label, handler, primary]) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      if (primary) b.className = 'primary';
+      b.addEventListener('click', () => {
+        hideProgressBanner();
+        handler();
+      });
+      row.appendChild(b);
+    });
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'close';
+    close.textContent = '✕';
+    close.title = 'Đóng';
+    close.addEventListener('click', hideProgressBanner);
+    box.append(p, row, close);
+    document.body.appendChild(box);
+    progressBanner = box;
+  }
+
+  function deviceLabel(position) {
+    return (position && position.device_name) || 'Thiết bị khác';
+  }
+
+  // "Chuyển tới": go where the other device is, without writing — that
+  // chapter already is the position, so just catch up with its rev.
+  function followPosition(position) {
+    adoptPosition(position);
+    if (position.chapter !== currentChapterNum) jumpToChapterNum(position.chapter, { post: false });
+  }
+
+  function openReadingHistory() {
+    window.location.href = `/books/${bookId}/index.html#reading-history`;
+  }
+
+  // 409: this tab decided on an outdated position. Asked here, where the
+  // user just acted. Playback (auto_next) is never interrupted by this.
+  function showConflictBanner(position, chapter) {
+    if (!position) {
+      showProgressBanner('Không lưu được vị trí đọc (dữ liệu trên máy chủ vừa thay đổi).', [
+        ['Lịch sử', openReadingHistory],
+      ]);
       return;
     }
-    fetch('/api/progress', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }).catch(() => {});
+    showProgressBanner(
+      `${deviceLabel(position)} đang ở chương ${position.chapter + 1} (${formatPositionTime(position.updated_at)}).`,
+      [
+        [`Đọc chương ${chapter + 1} ở đây`, () => postProgressEvent(chapter, 'restore', { baseRev: position.rev }), true],
+        [`Chuyển tới chương ${position.chapter + 1}`, () => followPosition(position)],
+        ['Lịch sử', openReadingHistory],
+      ]
+    );
+  }
+
+  // Tab visible again: pick up what other devices did meanwhile. Never
+  // navigates by itself — just offers it.
+  async function refreshRemotePosition() {
+    const progress = await fetchProgress();
+    if (!progress) return;
+    const remote = progress[bookId];
+    if (!remote || (progressLoaded && remote.rev <= progressRev)) return;
+    if (remote.device_id && remote.device_id === deviceId()) {
+      adoptPosition(remote);
+      return;
+    }
+    // While audio is playing keep the old base_rev (design doc 6.2): the
+    // next auto-advance then gets a 409 and asks, instead of two listening
+    // sessions silently taking the position from each other.
+    if (active && !paused) return;
+    adoptPosition(remote);
+    if (remote.chapter !== currentChapterNum) {
+      showProgressBanner(`${deviceLabel(remote)} đã chuyển sang chương ${remote.chapter + 1}.`, [
+        ['Chuyển', () => followPosition(remote), true],
+      ]);
+    }
   }
 
   // Runs once per page load, after both the chapter content and the saved
@@ -178,21 +448,22 @@
   // — start()'s existing "if (!sentences.length) sentences = wrap..." guard
   // then leaves `index` alone instead of resetting it to 0, so pressing ▶
   // continues from here (same trick ReaderPlaybackController.prepareResume
-  // uses on iOS). Otherwise this is a fresh chapter visit (direct link,
-  // manual browsing) — record it as the new baseline immediately, same as
-  // a manual chapter jump would.
+  // uses on iOS). Otherwise this is just a page being opened — no write
+  // (see the sync comment above); only a pending chapter-link click from
+  // the book page counts as choosing this chapter.
   function applyResumeOrBaseline(progress) {
+    if (progress) adoptPosition(progress[bookId]);
     const saved = progress && progress[bookId];
     if (saved && saved.chapter === currentChapterNum) {
       sentences = wrapContentSentences(document.querySelector('article'));
       if (sentences.length) {
-        index = Math.min(Math.max(saved.sentence, 0), sentences.length - 1);
+        index = Math.min(Math.max(saved.sentence || 0, 0), sentences.length - 1);
         highlightSentence(index);
         updateProgress();
       }
-    } else {
-      postProgress(currentChapterNum, 0);
     }
+    const pending = takePendingSelect();
+    if (pending) postProgressEvent(pending.chapter, 'select', { id: pending.id, baseRev: pending.base_rev ?? undefined });
   }
 
   function splitSentences(text) {
@@ -1064,7 +1335,7 @@
       dropPreloadedAudio(); // cached audio was keyed by the old chapter's sentence indices
       sentences = wrapContentSentences(document.querySelector('article'));
       index = 0;
-      postProgress(nextNum, 0);
+      postProgressEvent(nextNum, 'auto_next');
       if (!sentences.length) break;
       // Reuse the prefetched first-sentence audio (if it's ready) instead of
       // starting a fresh fetch here — keeps the upcoming .play() close to
@@ -1113,7 +1384,6 @@
     if (audioEl) audioEl.pause();
     updatePlayBtn();
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-    postProgress(currentChapterNum, index);
   }
 
   function resume() {
@@ -1133,7 +1403,6 @@
     if (audioEl) audioEl.pause();
     dropPreloadedAudio();
     updatePlayBtn();
-    postProgress(currentChapterNum, index);
   }
 
   // Escape / manual play-button-triggered stop ends the listening session
@@ -1148,8 +1417,9 @@
   // screen prev/next-track buttons, see setupMediaSession) go through the
   // same in-place fetch as auto-advance — not a real navigation. Mainly for
   // iOS playback continuity if the user jumps chapters mid-session, but
-  // it's a nicer instant transition either way.
-  async function jumpToChapterNum(num) {
+  // it's a nicer instant transition either way. `post: false` is for
+  // following a position that already is the server's (no event).
+  async function jumpToChapterNum(num, { post = true } = {}) {
     if (num < 0 || num >= totalChapters) return;
     const wasActive = active;
     if (wasActive) stop();
@@ -1162,7 +1432,7 @@
     }
     sentences = [];
     index = 0;
-    postProgress(num, 0);
+    if (post) postProgressEvent(num, 'select');
     if (wasActive) start();
   }
 
@@ -1548,6 +1818,7 @@
       document.querySelector('article').innerHTML = '<p>Lỗi tải nội dung chương. Thử tải lại trang.</p>';
     }
     buildControlBar();
+    injectProgressBannerStyles();
     if (bookId) applyResumeOrBaseline(await progressPromise);
     console.log(
       `reader.js: bootstrap() done — total ${(performance.now() - tBootstrap).toFixed(0)}ms, ` +
@@ -1555,15 +1826,10 @@
     );
   }
 
-  // Backgrounding the tab (switching apps, locking the screen) or closing it
-  // outright are the two "session might just end here" moments a reading
-  // page has that a native app's onDisappear/scenePhase covers for free —
-  // sync whatever the current position is so it isn't lost.
+  // Hiding or closing the tab deliberately writes nothing (see the sync
+  // comment near fetchProgress); coming back only reads.
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && bookId) postProgress(currentChapterNum, index, { beacon: true });
-  });
-  window.addEventListener('pagehide', () => {
-    if (bookId) postProgress(currentChapterNum, index, { beacon: true });
+    if (!document.hidden && bookId) refreshRemotePosition();
   });
 
   applyFontScale();
