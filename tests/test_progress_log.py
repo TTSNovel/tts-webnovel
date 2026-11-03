@@ -445,3 +445,21 @@ def test_from_env_picks_gcs_on_cloud_run(tmp_path, monkeypatch):
     assert log.store._ctx()[1] == "my-bucket"
     monkeypatch.delenv("K_SERVICE")
     assert isinstance(progress_log.from_env(tmp_path, None).store, LocalStore)
+
+
+def test_gcs_store_drops_user_project_header(monkeypatch):
+    # x-goog-user-project made every GCS call need serviceusage.services.use,
+    # which the Cloud Run service account lacks (403 → 503 on /api/progress).
+    sent = {}
+
+    class Resp:
+        status_code = 404
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        sent.update(headers)
+        return Resp()
+
+    monkeypatch.setattr(progress_log.requests, "get", fake_get)
+    store = progress_log.GcsStore(lambda: ({"Authorization": "Bearer t", "x-goog-user-project": "p"}, "p"))
+    assert store.read(1) == (None, 0)
+    assert sent == {"Authorization": "Bearer t"}

@@ -196,6 +196,11 @@ class GcsStore:
 
     def _ctx(self):
         headers, project = self._headers_fn()
+        # translation._headers adds x-goog-user-project for the Translation
+        # API; on GCS it makes the call need serviceusage.services.use, which
+        # the Cloud Run service account doesn't have (every request 403s).
+        # The bucket lives in the same project, so it isn't needed here.
+        headers = {k: v for k, v in headers.items() if k.lower() != "x-goog-user-project"}
         if not self._bucket:
             self._bucket = f"{project}-novel-web-site"
         return headers, self._bucket
