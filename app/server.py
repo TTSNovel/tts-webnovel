@@ -24,6 +24,7 @@ from pathlib import Path
 import requests
 from flask import Flask, Response, abort, redirect, request, send_from_directory, session
 
+import progress_log
 import translation
 from book_renderer import _CSS
 from build_library import _LEGACY_EXTENSIONS, add_book_to_site, write_index
@@ -267,47 +268,61 @@ def download_page():
     return _DOWNLOAD_PAGE.format(pwa_head=_PWA_HEAD, css=_CSS)
 
 
-def _progress_path(site_dir):
-    return Path(site_dir) / "progress.json"
+# Reading position lives in progress_log.py (append-only event log per book,
+# compare-and-swap writes). The v1 progress.json is only read from there, to
+# seed books that have no v2 document yet.
+PROGRESS = progress_log.from_env(SITE_DIR, translation._headers)
 
 
-def _load_progress(site_dir):
-    path = _progress_path(site_dir)
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-
-
-def _save_progress(site_dir, data):
-    _progress_path(site_dir).write_text(json.dumps(data), encoding="utf-8")
+def _progress_unavailable(e):
+    print(json.dumps({"message": "progress storage unavailable", "error": str(e)}), flush=True)
+    return Response("Progress storage unavailable", 503)
 
 
 @app.route("/api/progress", methods=["GET"])
 @require_auth
 def progress_list():
-    return _load_progress(SITE_DIR)
+    try:
+        return PROGRESS.positions()
+    except progress_log.Unavailable as e:
+        return _progress_unavailable(e)
 
 
+@app.route("/api/progress/<int:book_id>/history", methods=["GET"])
+@require_auth
+def progress_history(book_id):
+    limit = request.args.get("limit", progress_log.HISTORY_DEFAULT_LIMIT, type=int)
+    try:
+        return PROGRESS.history(book_id, limit)
+    except progress_log.Unavailable as e:
+        return _progress_unavailable(e)
+
+
+@app.route("/api/progress/events", methods=["POST"])
+@require_auth
+def progress_event():
+    body = request.get_json(force=True, silent=True)
+    try:
+        status, payload = PROGRESS.post_event(body, progress_log.device_from_headers(request.headers))
+    except progress_log.Unavailable as e:
+        return _progress_unavailable(e)
+    return payload, status
+
+
+# v1 clients (old app builds, a web reader still cached by the service
+# worker) — recorded as a "legacy" event; whether it still moves the
+# position is PROGRESS_LEGACY_MODE's call (see progress_log.post_legacy).
 @app.route("/api/progress", methods=["POST"])
 @require_auth
 def progress_update():
-    body = request.get_json(force=True, silent=True) or {}
-    book_id = body.get("book_id")
-    chapter = body.get("chapter")
-    sentence = body.get("sentence")
-    if not isinstance(book_id, int) or not isinstance(chapter, int) or not isinstance(sentence, int):
+    body = request.get_json(force=True, silent=True)
+    try:
+        status, payload = PROGRESS.post_legacy(body, progress_log.device_from_headers(request.headers))
+    except progress_log.Unavailable as e:
+        return _progress_unavailable(e)
+    if status == 400:
         abort(400)
-
-    data = _load_progress(SITE_DIR)
-    # Server stamps its own clock rather than trusting the client's — every
-    # timestamp compared during the app's last-write-wins merge (deciding
-    # which device's progress is newer) is then issued by the same clock.
-    record = {
-        "chapter": chapter,
-        "sentence": sentence,
-        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
-    data[str(book_id)] = record
-    _save_progress(SITE_DIR, data)
-    return record
+    return payload, status
 
 
 def _filter_words_path(site_dir):
