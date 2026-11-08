@@ -603,7 +603,9 @@ def render_book_page(
 def render_index_page(books_by_category: dict[str, list[dict]], version: str = "") -> str:
     category_blocks = []
     for category in sorted(books_by_category):
-        books = sorted(books_by_category[category], key=lambda b: b["title"])
+        # books.json order = the order books were added (same order the iOS
+        # app's library list shows), not alphabetical.
+        books = books_by_category[category]
         cards = []
         for b in books:
             # Always emit the .author span, even blank — its CSS reserves a
