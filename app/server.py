@@ -234,7 +234,7 @@ def import_submit():
         f'({entry["n"]} chương, thể loại {html.escape(entry["category"])}) — '
         f'<a href="/books/{entry["id"]}/index.html">Xem ngay</a></div>'
     )
-    return _IMPORT_PAGE.format(pwa_head=_PWA_HEAD, css=_CSS, msg_html=msg)
+    return _import_page(msg)
 
 
 _DOWNLOAD_PAGE = """<!doctype html>
