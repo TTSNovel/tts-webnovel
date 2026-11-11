@@ -1223,7 +1223,13 @@
   function compileFilterRule(rule) {
     const pattern = String(rule.pattern || '').replace(INVISIBLE_CHARS, '');
     if (!pattern) return null;
-    if (!rule.is_regex) return (s) => s.split(pattern).join('');
+    if (!rule.is_regex) {
+      // Collapsed like the paragraph text it's matched against (see
+      // applyFilterWords), so a line copied with a stray trailing space or
+      // line break still matches.
+      const plain = pattern.replace(/\s+/g, ' ').trim();
+      return plain ? (s) => s.split(plain).join('') : null;
+    }
     let src = pattern;
     let flags = 'g';
     // ICU's leading inline flags, e.g. "(?m)^Nguồn:.*$" — JS takes them as
@@ -1248,7 +1254,13 @@
     return null;
   }
 
-  // Strips every rule's matches from the text nodes under `root`, in place.
+  // Strips every rule's matches from `root`, in place. Matched paragraph by
+  // paragraph against its text as displayed (whitespace collapsed), not node
+  // by node — scraped ads are often split across inline markup and source
+  // line breaks ("…for as low as\n  <strong>$1</strong>!"), which a rule
+  // copied from the screen could never match one fragment at a time. A
+  // paragraph a rule changed is rewritten as plain text; untouched ones keep
+  // their markup. Text outside any paragraph is still matched node by node.
   // The leftover-CJK rule is skipped when the text itself is Chinese (an
   // untranslated chapter), where it would wipe everything — same as the app.
   function applyFilterWords(root) {
@@ -1260,12 +1272,27 @@
       .filter((r) => !(chinese && String(r.id).toUpperCase() === CJK_RULE_ID))
       .map((r) => r.fn);
     if (!fns.length) return;
+    const filter = (s) => fns.reduce((acc, fn) => fn(acc), s);
+    root.querySelectorAll(SENTENCE_BLOCKS).forEach((block) => {
+      if (block.querySelector(SENTENCE_BLOCKS)) return; // only innermost paragraphs
+      const shown = block.textContent.replace(INVISIBLE_CHARS, '').replace(/\s+/g, ' ').trim();
+      const filtered = filter(shown);
+      if (filtered !== shown) block.textContent = filtered.trim();
+    });
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-      let s = n.nodeValue.replace(INVISIBLE_CHARS, '');
-      for (const fn of fns) s = fn(s);
+      if (n.parentElement && n.parentElement.closest(SENTENCE_BLOCKS)) continue;
+      const s = filter(n.nodeValue.replace(INVISIBLE_CHARS, ''));
       if (s !== n.nodeValue) n.nodeValue = s;
     }
+  }
+
+  // After the list changes: the stored translation was made from text
+  // filtered by the old list, so it's redone from the newly filtered original.
+  function refilterChapter() {
+    chapterTranslatedHtml = null;
+    nextChapterPrefetch = null; // its first sentence was filtered under the old list
+    return rerenderChapter(showingTranslation);
   }
 
   // Pulls the account's list. An account nobody has written a list to yet
@@ -1403,7 +1430,7 @@
     filterWords.draft = filterWords.rules.map((r) => ({ ...r }));
     renderFilterWords();
     setFilterWordsStatus('Đang tải…');
-    if (await refreshFilterWords()) rerenderChapter(showingTranslation);
+    if (await refreshFilterWords()) refilterChapter();
     filterWords.draft = filterWords.rules.map((r) => ({ ...r }));
     filterWords.loaded = true;
     setFilterWordsStatus('Chữ khớp quy tắc bị bỏ khỏi chương — không hiển thị, không đọc.');
@@ -1440,8 +1467,7 @@
     filterWords.draft = filterWords.rules.map((r) => ({ ...r }));
     filterWords.dirty = false;
     renderFilterWords();
-    nextChapterPrefetch = null; // its first sentence was filtered under the old list
-    rerenderChapter(showingTranslation);
+    refilterChapter();
   }
 
   // `html` translated by the current engine, or null if the chapter
@@ -1451,6 +1477,11 @@
     if (!engine.needsTranslation(textOfHtml(html))) return null;
     const tmp = document.createElement('div');
     tmp.innerHTML = html;
+    // Filtered before translating too (renderChapterContent filters the
+    // result again): a rule written against the original — e.g. an English
+    // ad line — can't match once it's been translated into Vietnamese, and
+    // there's no point paying to translate text that won't be shown anyway.
+    applyFilterWords(tmp);
     await engine.translate(tmp, num);
     return tmp.innerHTML;
   }
@@ -2159,7 +2190,7 @@
     }
     buildControlBar();
     injectProgressBannerStyles();
-    if ((await filterWordsPromise) && chapterLoaded) await rerenderChapter(showingTranslation);
+    if ((await filterWordsPromise) && chapterLoaded) await refilterChapter();
     if (bookId) applyResumeOrBaseline(await progressPromise);
     console.log(
       `reader.js: bootstrap() done — total ${(performance.now() - tBootstrap).toFixed(0)}ms, ` +
