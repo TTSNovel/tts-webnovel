@@ -531,6 +531,7 @@
   function firstSentenceOf(html) {
     const tmp = document.createElement('div');
     tmp.innerHTML = html;
+    applyFilterWords(tmp); // what renderChapterContent will show, so the audio matches
     const nodes = tmp.querySelectorAll(SENTENCE_BLOCKS);
     for (const node of nodes) {
       if (node.dataset.readerSkip !== undefined) continue;
@@ -1124,6 +1125,325 @@
     }
   }
 
+  // ── Filter Words ──────────────────────────────────────────────────────────
+  // Same per-account list as the app's "Filter Words" screen (tts-novel-ios's
+  // FilterWordsStore), synced whole-list-at-once through /api/filter-words.
+  // Matched text is stripped from the chapter as it's shown, so it's neither
+  // displayed nor read aloud (wrapContentSentences reads the filtered DOM).
+  // A copy is kept in localStorage so the first render (and offline reading)
+  // doesn't wait on the network.
+  //
+  // Seeded the same way as the app (DefaultFilterWords.seed) — same ids, so
+  // whichever client first writes them to an empty account, they're the
+  // same rules.
+  const CJK_RULE_ID = '4AF37E7E-64FB-4D46-8835-4B4DD3C24A4D';
+  const DEFAULT_FILTER_WORDS = [
+    ['8FE527A7-15D5-4A03-AB9D-F3DD3232A9F1', 'https?://\\S+', true, 'Full link (http/https)'],
+    ['C94BD679-4E42-47C2-9D62-22BD2F4E0B87', '\\bwww\\.[^\\s]+\\b', true, 'Web address starting with www.'],
+    ['BBEB29F0-D7A7-4A98-8DFB-ABD07B7837B0', '[\\w.+-]+@[\\w-]+\\.[\\w.-]+', true, 'Email address'],
+    [
+      '7A1D84D0-86FB-4676-9C6D-5E5A9F6A4CF8',
+      '\\b[a-zA-Z0-9-]+\\.(com|net|org|vn|info|me|tv|club|xyz|top|shop|ly|gg|io|fun)\\b',
+      true,
+      'Website domain (.com, .vn, .net, ...)',
+    ],
+    [CJK_RULE_ID, '[一-鿿぀-ヿ가-힣]+', true, 'Leftover Chinese/Japanese/Korean characters'],
+    ['9776BAC8-077C-4E98-A167-960BCCFEF569', '[\u{1F300}-\u{1FAFF}☀-➿]', true, 'Emoji'],
+    [
+      '683274C8-6B36-4F1A-9B20-D9A4628F4681',
+      '(?m)^(Nguồn|Convert|Editor|Beta)\\s*:.*$',
+      true,
+      'Converter credit line (Nguồn/Convert/Editor/Beta:)',
+    ],
+    ['F0521A04-221E-4A36-9F54-C8598B7C6E9B', '\\((?:TN|ND)[:\\-][^)]*\\)', true, 'Translator note (TN/ND: ...)'],
+    ['E2BE60AC-DD40-4466-BAFF-11F3E3E85E6D', 'Đọc truyện tại', false, 'Promo phrase “Đọc truyện tại”'],
+    ['636B5567-A8FA-449B-96B8-A62993293D52', 'Group đọc truyện', false, 'Promo phrase “Group đọc truyện”'],
+    ['835D1C01-B7CB-4398-8561-94D289DCD3F3', '#\\w+', true, 'Hashtag (#...)'],
+    ['F22EB11F-E905-4E4D-83E0-D20B01891367', '@\\w+', true, 'Mention (@...)'],
+  ].map(([id, pattern, is_regex, label]) => ({ id, pattern, is_regex, label }));
+
+  const FILTER_WORDS_KEY = 'reader.filterWords';
+  const INVISIBLE_CHARS = /[​‌‍⁠﻿]/g;
+  // The app's patterns run on ICU (NSRegularExpression), where \w and \b are
+  // Unicode-aware; in JS they're ASCII-only even with the u flag, which would
+  // e.g. cut "#truyệnhay" at the "ệ". Rewritten to their Unicode meaning.
+  const WORD_CHARS = '\\p{L}\\p{M}\\p{N}_';
+  const WORD_BOUNDARY = `(?:(?<=[${WORD_CHARS}])(?![${WORD_CHARS}])|(?<![${WORD_CHARS}])(?=[${WORD_CHARS}]))`;
+  const NOT_WORD_BOUNDARY = `(?:(?<=[${WORD_CHARS}])(?=[${WORD_CHARS}])|(?<![${WORD_CHARS}])(?![${WORD_CHARS}]))`;
+
+  const filterWords = {
+    rules: loadCachedFilterWords(),
+    compiled: null,
+    // Editor state — a working copy, so closing without saving changes nothing.
+    draft: [],
+    dirty: false,
+    loaded: false,
+    el: null,
+  };
+
+  function loadCachedFilterWords() {
+    try {
+      const cached = JSON.parse(localStorage.getItem(FILTER_WORDS_KEY));
+      if (cached && Array.isArray(cached.rules)) return cached.rules;
+    } catch (e) {
+      /* fall through to the defaults */
+    }
+    return DEFAULT_FILTER_WORDS;
+  }
+
+  function setFilterWords(rules) {
+    filterWords.rules = rules;
+    filterWords.compiled = null;
+    localStorage.setItem(FILTER_WORDS_KEY, JSON.stringify({ rules }));
+  }
+
+  function icuPatternToJs(src) {
+    let out = '';
+    let inClass = false;
+    for (let i = 0; i < src.length; i++) {
+      const c = src[i];
+      if (c === '\\' && i + 1 < src.length) {
+        const n = src[++i];
+        if (n === 'w') out += inClass ? WORD_CHARS : `[${WORD_CHARS}]`;
+        else if (n === 'W' && !inClass) out += `[^${WORD_CHARS}]`;
+        else if (n === 'b' && !inClass) out += WORD_BOUNDARY;
+        else if (n === 'B' && !inClass) out += NOT_WORD_BOUNDARY;
+        else out += c + n;
+        continue;
+      }
+      if (c === '[' && !inClass) inClass = true;
+      else if (c === ']' && inClass) inClass = false;
+      out += c;
+    }
+    return out;
+  }
+
+  // A rule as a string → string function, or null if it can't be compiled
+  // (skipped, same as the app — a bad rule never breaks reading).
+  function compileFilterRule(rule) {
+    const pattern = String(rule.pattern || '').replace(INVISIBLE_CHARS, '');
+    if (!pattern) return null;
+    if (!rule.is_regex) return (s) => s.split(pattern).join('');
+    let src = pattern;
+    let flags = 'g';
+    // ICU's leading inline flags, e.g. "(?m)^Nguồn:.*$" — JS takes them as
+    // RegExp flags instead.
+    const inline = src.match(/^\(\?([a-z]+)\)/);
+    if (inline) {
+      if (/[^ims]/.test(inline[1])) return null;
+      src = src.slice(inline[0].length);
+      flags += inline[1];
+    }
+    for (const [s, f] of [
+      [icuPatternToJs(src), flags + 'u'],
+      [src, flags],
+    ]) {
+      try {
+        const re = new RegExp(s, f);
+        return (text) => text.replace(re, '');
+      } catch (e) {
+        /* try the next form */
+      }
+    }
+    return null;
+  }
+
+  // Strips every rule's matches from the text nodes under `root`, in place.
+  // The leftover-CJK rule is skipped when the text itself is Chinese (an
+  // untranslated chapter), where it would wipe everything — same as the app.
+  function applyFilterWords(root) {
+    if (!filterWords.compiled) {
+      filterWords.compiled = filterWords.rules.map((r) => ({ id: r.id, fn: compileFilterRule(r) })).filter((r) => r.fn);
+    }
+    const chinese = detectSourceLanguage(root.textContent) === 'zh';
+    const fns = filterWords.compiled
+      .filter((r) => !(chinese && String(r.id).toUpperCase() === CJK_RULE_ID))
+      .map((r) => r.fn);
+    if (!fns.length) return;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      let s = n.nodeValue.replace(INVISIBLE_CHARS, '');
+      for (const fn of fns) s = fn(s);
+      if (s !== n.nodeValue) n.nodeValue = s;
+    }
+  }
+
+  // Pulls the account's list. An account nobody has written a list to yet
+  // (the server's epoch updated_at) gets this browser's list pushed up, like
+  // the app's FilterWordsStore.refreshFromServer. Resolves true if the list
+  // changed.
+  async function refreshFilterWords() {
+    try {
+      const resp = await fetch('/api/filter-words');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const remote = await resp.json();
+      if (!remote.updated_at || remote.updated_at.startsWith('1970-')) {
+        if (filterWords.rules.length) postFilterWords(filterWords.rules).catch(() => {});
+        return false;
+      }
+      const changed = JSON.stringify(remote.rules) !== JSON.stringify(filterWords.rules);
+      if (changed) setFilterWords(remote.rules);
+      return changed;
+    } catch (e) {
+      console.warn('reader.js: filter words not refreshed ::', (e && e.message) || e);
+      return false;
+    }
+  }
+
+  async function postFilterWords(rules) {
+    const resp = await fetch('/api/filter-words', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rules }),
+    });
+    if (!resp.ok) throw new Error((await resp.text()) || `HTTP ${resp.status}`);
+    const stored = await resp.json();
+    setFilterWords(stored.rules);
+    return stored;
+  }
+
+  const FILTER_WORDS_CSS = `
+.fw-row { display: grid; grid-template-columns: 1fr auto auto; gap: .35rem .4rem; align-items: center; padding: .55rem 0; border-bottom: 1px solid var(--border); }
+.fw-row .fw-label { grid-column: 1 / -1; }
+.fw-row .fw-regex { display: flex; align-items: center; gap: .25rem; font-size: .8rem; color: var(--muted); white-space: nowrap; }
+.fw-row .fw-regex input { width: auto; padding: 0; }
+.fw-row.invalid .fw-pattern { border-color: #ef4444; }
+`;
+
+  function buildFilterWordsEditor() {
+    if (!glossary.el) buildGlossaryEditor(); // shares its overlay/box styles
+    const style = document.createElement('style');
+    style.textContent = FILTER_WORDS_CSS;
+    document.head.appendChild(style);
+    const overlay = document.createElement('div');
+    overlay.className = 'glossary-overlay';
+    overlay.hidden = true;
+    overlay.innerHTML = `
+      <div class="glossary-box" role="dialog" aria-label="Filter Words">
+        <div class="glossary-head"><h2>Filter Words</h2><button class="icon-btn" data-f="close" title="Đóng">✕</button></div>
+        <div class="glossary-tools">
+          <span style="flex:1"></span>
+          <button class="glossary-btn ghost" data-f="defaults" title="Thêm lại các quy tắc mặc định đã xoá">Mặc định</button>
+          <button class="glossary-btn ghost" data-f="add">+ Thêm</button>
+        </div>
+        <div class="glossary-list" data-f="list"></div>
+        <div class="glossary-foot">
+          <span class="status" data-f="status"></span>
+          <button class="glossary-btn" data-f="save">Lưu</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const q = (name) => overlay.querySelector(`[data-f="${name}"]`);
+    filterWords.el = { overlay, list: q('list'), status: q('status'), save: q('save') };
+
+    q('close').addEventListener('click', closeFilterWordsEditor);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) closeFilterWordsEditor();
+    });
+    q('add').addEventListener('click', () => {
+      filterWords.draft.unshift({ id: newUuid().toUpperCase(), pattern: '', is_regex: false, label: '' });
+      filterWords.dirty = true;
+      renderFilterWords();
+      filterWords.el.list.querySelector('.fw-pattern')?.focus();
+    });
+    q('defaults').addEventListener('click', () => {
+      const have = new Set(filterWords.draft.map((r) => String(r.id).toUpperCase()));
+      const missing = DEFAULT_FILTER_WORDS.filter((r) => !have.has(r.id));
+      if (!missing.length) return setFilterWordsStatus('Đã có đủ quy tắc mặc định.');
+      filterWords.draft.push(...missing.map((r) => ({ ...r })));
+      filterWords.dirty = true;
+      renderFilterWords();
+      setFilterWordsStatus(`Đã thêm ${missing.length} quy tắc mặc định — bấm Lưu để áp dụng.`);
+    });
+    filterWords.el.save.addEventListener('click', saveFilterWords);
+    // Inputs are re-rendered on add/remove, so edits are read back from the
+    // event target instead of holding per-row listeners.
+    filterWords.el.list.addEventListener('input', (e) => {
+      const row = e.target.closest('[data-i]');
+      if (!row) return;
+      const rule = filterWords.draft[row.dataset.i];
+      const field = e.target.dataset.field;
+      rule[field] = field === 'is_regex' ? e.target.checked : e.target.value;
+      row.classList.toggle('invalid', !!rule.pattern && !compileFilterRule(rule));
+      filterWords.dirty = true;
+    });
+    filterWords.el.list.addEventListener('click', (e) => {
+      const row = e.target.closest('[data-i]');
+      if (!row || e.target.dataset.f !== 'remove') return;
+      filterWords.draft.splice(parseInt(row.dataset.i, 10), 1);
+      filterWords.dirty = true;
+      renderFilterWords();
+    });
+  }
+
+  function setFilterWordsStatus(text, isError) {
+    filterWords.el.status.textContent = text;
+    filterWords.el.status.classList.toggle('err', !!isError);
+  }
+
+  function renderFilterWords() {
+    const rows = filterWords.draft.map(
+      (r, i) => `<div class="fw-row${r.pattern && !compileFilterRule(r) ? ' invalid' : ''}" data-i="${i}">
+        <input class="fw-pattern" data-field="pattern" value="${escapeAttr(r.pattern)}" placeholder="Từ hoặc regex cần lọc">
+        <label class="fw-regex"><input type="checkbox" data-field="is_regex"${r.is_regex ? ' checked' : ''}>Regex</label>
+        <button class="icon-btn" data-f="remove" title="Xoá">✕</button>
+        <input class="fw-label" data-field="label" value="${escapeAttr(r.label)}" placeholder="Tên (không bắt buộc)">
+      </div>`
+    );
+    filterWords.el.list.innerHTML = rows.length
+      ? rows.join('')
+      : `<div class="glossary-empty">${filterWords.loaded ? 'Chưa có quy tắc nào.' : 'Đang tải…'}</div>`;
+  }
+
+  async function openFilterWordsEditor() {
+    if (!filterWords.el) buildFilterWordsEditor();
+    filterWords.el.overlay.hidden = false;
+    if (filterWords.dirty) return renderFilterWords(); // keep unsaved edits from last time
+    filterWords.loaded = false;
+    filterWords.draft = filterWords.rules.map((r) => ({ ...r }));
+    renderFilterWords();
+    setFilterWordsStatus('Đang tải…');
+    if (await refreshFilterWords()) rerenderChapter(showingTranslation);
+    filterWords.draft = filterWords.rules.map((r) => ({ ...r }));
+    filterWords.loaded = true;
+    setFilterWordsStatus('Chữ khớp quy tắc bị bỏ khỏi chương — không hiển thị, không đọc.');
+    renderFilterWords();
+  }
+
+  function closeFilterWordsEditor() {
+    filterWords.el.overlay.hidden = true;
+  }
+
+  async function saveFilterWords() {
+    const rules = filterWords.draft
+      .filter((r) => r.pattern.trim())
+      .map((r) => ({
+        id: r.id,
+        pattern: r.pattern,
+        is_regex: !!r.is_regex,
+        ...(r.label && r.label.trim() ? { label: r.label.trim() } : {}),
+      }));
+    const bad = rules.find((r) => !compileFilterRule(r));
+    if (bad) return setFilterWordsStatus(`Regex không hợp lệ: ${bad.pattern}`, true);
+    filterWords.el.save.disabled = true;
+    setFilterWordsStatus('Đang lưu…');
+    try {
+      await postFilterWords(rules);
+      setFilterWordsStatus('Đã lưu. Chương đang mở đã được lọc lại.');
+    } catch (e) {
+      // Still applied here — only the sync to other devices failed.
+      setFilterWords(rules);
+      setFilterWordsStatus(`Đã áp dụng trên trình duyệt này nhưng chưa đồng bộ lên server: ${(e && e.message) || e}`, true);
+    } finally {
+      filterWords.el.save.disabled = false;
+    }
+    filterWords.draft = filterWords.rules.map((r) => ({ ...r }));
+    filterWords.dirty = false;
+    renderFilterWords();
+    nextChapterPrefetch = null; // its first sentence was filtered under the old list
+    rerenderChapter(showingTranslation);
+  }
+
   // `html` translated by the current engine, or null if the chapter
   // doesn't need it. Throws if the engine fails.
   async function translateHtml(html, num) {
@@ -1142,6 +1462,7 @@
     const article = document.querySelector('article');
     const generation = ++renderGeneration;
     article.innerHTML = chapterOriginalHtml;
+    applyFilterWords(article);
     if (!showingTranslation) return;
     if (chapterTranslatedHtml == null) {
       if (els) els.translateToggle.classList.add('busy');
@@ -1158,7 +1479,10 @@
       }
       if (generation !== renderGeneration) return;
     }
-    if (chapterTranslatedHtml != null) article.innerHTML = chapterTranslatedHtml;
+    if (chapterTranslatedHtml != null) {
+      article.innerHTML = chapterTranslatedHtml;
+      applyFilterWords(article);
+    }
   }
 
   function updateTranslateBtn() {
@@ -1629,6 +1953,8 @@
         </select>
       </label>
       <button type="button" class="dl-btn" data-role="glossaryOpen" title="Thuật ngữ cố định khi dịch bằng Google Translate">Glossary (Google Translate)…</button>
+      <div class="reader-settings-heading">Lọc</div>
+      <button type="button" class="dl-btn" data-role="filterWordsOpen" title="Bỏ link, quảng cáo, ghi chú… khỏi chương — không hiển thị, không đọc">Filter Words…</button>
       <label class="reader-settings-checkbox">
         <input type="checkbox" data-role="autoTranslate">
         Tự động dịch chương không phải tiếng Việt
@@ -1726,6 +2052,11 @@
       openGlossaryEditor();
     });
 
+    panel.querySelector('[data-role="filterWordsOpen"]').addEventListener('click', (e) => {
+      e.stopPropagation();
+      openFilterWordsEditor();
+    });
+
     els.translateToggle.addEventListener('click', () => toggleTranslation());
     updateTranslateBtn();
 
@@ -1811,14 +2142,19 @@
     // <article>) — fetched in parallel rather than after, same reasoning as
     // meta.json + chapter content inside initChapterPage().
     const progressPromise = fetchProgress();
+    // The chapter renders with the cached list right away; only re-filtered
+    // if the account's list turns out to differ (edited on another device).
+    const filterWordsPromise = refreshFilterWords();
+    let chapterLoaded = false;
     try {
-      await initChapterPage();
+      chapterLoaded = await initChapterPage();
     } catch (e) {
       console.error('reader.js: initChapterPage() failed ::', (e && e.message) || e);
       document.querySelector('article').innerHTML = '<p>Lỗi tải nội dung chương. Thử tải lại trang.</p>';
     }
     buildControlBar();
     injectProgressBannerStyles();
+    if ((await filterWordsPromise) && chapterLoaded) await rerenderChapter(showingTranslation);
     if (bookId) applyResumeOrBaseline(await progressPromise);
     console.log(
       `reader.js: bootstrap() done — total ${(performance.now() - tBootstrap).toFixed(0)}ms, ` +
