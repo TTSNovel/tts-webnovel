@@ -25,12 +25,14 @@ _CATEGORIES: list[tuple[str, list[str]]] = [
     # diacritic-stripped Vietnamese keywords below on their own.
     ("LitRPG - Progression Fantasy", [
         "litrpg", "system interface", "skill tree", "dungeon core", "class evolution",
+        "system", "beast master", "hunter",
     ]),
     ("Cultivation - Fantasy", [
         "tu tien", "tu luyen", "dao ton", "tong mon", "linh khi", "kim dan",
         "nguyen anh", "hoa than", "phi thang", "tien dao", "huyen huyen",
         "ma phap", "phap su", "yeu nghiet", "than co nhan", "chan nhan",
         "huyen ao", "vo hiep", "vo thuat", "giang ho", "kiem hiep", "vo dao",
+        "cultivation", "magus", "immortal",
     ]),
     ("Apocalypse - Survival", [
         "tan the", "mat the", "sinh ton", "khung bo", "zombie", "di gioi", "phuc bam",
@@ -55,7 +57,15 @@ _CATEGORIES: list[tuple[str, list[str]]] = [
     ]),
 ]
 
-_DEFAULT_CATEGORY = "Other"
+# Assigned by hand only (no keyword can recognise "translated from another
+# language"), but still a valid choice on /import.
+_MANUAL_ONLY_CATEGORIES = ["Foreign Literature"]
+
+# Every category a book is allowed to have. There is deliberately no
+# "Other"/"Khác" catch-all: a book the keywords can't place gets its
+# category picked by hand at import time instead of landing in a dumping
+# ground (see build_library.add_book_to_site).
+CATEGORIES: list[str] = [c for c, _ in _CATEGORIES] + _MANUAL_ONLY_CATEGORIES
 
 
 def _strip_diacritics(text: str) -> str:
@@ -64,7 +74,9 @@ def _strip_diacritics(text: str) -> str:
     return stripped.replace("đ", "d").replace("Đ", "D")
 
 
-def classify(title: str, description: str = "") -> str:
+def classify(title: str, description: str = "") -> str | None:
+    """Best keyword match, or None when nothing matches — callers must then
+    get the category from somewhere else (the importer's pick)."""
     haystack = _strip_diacritics(f"{title} {description}".lower())
     haystack = re.sub(r"[^a-z0-9\s]", " ", haystack)
 
@@ -72,4 +84,4 @@ def classify(title: str, description: str = "") -> str:
         for kw in keywords:
             if kw in haystack:
                 return category
-    return _DEFAULT_CATEGORY
+    return None

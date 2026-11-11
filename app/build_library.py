@@ -43,7 +43,7 @@ from book_renderer import (
     render_chapter_titles,
     render_index_page,
 )
-from classify import classify
+from classify import CATEGORIES, classify
 from epub_parser import extract_book, extract_book_from_mobi, extract_cover
 
 _LEGACY_EXTENSIONS = {".prc", ".mobi", ".azw3"}
@@ -183,11 +183,19 @@ def _iter_book_paths(inputs: list[str]) -> list[Path]:
     return paths
 
 
-def add_book_to_site(site_dir: Path, epub_path: Path, used_ids: set[int]) -> dict:
+def _check_category(category: str) -> None:
+    if category not in CATEGORIES:
+        raise ValueError(f"invalid category {category!r} — must be one of: {', '.join(CATEGORIES)}")
+
+
+def add_book_to_site(site_dir: Path, epub_path: Path, used_ids: set[int], category: str | None = None) -> dict:
     """Extract + render a single book into site_dir/books/<id>/, returning
     its books.json entry. Shared by the bulk CLI builder and the live
     /import endpoint — the only difference is the caller's used_ids set
-    (bulk building starts empty; live import loads it from books.json)."""
+    (bulk building starts empty; live import loads it from books.json).
+
+    category overrides the keyword classifier; without it, a book the
+    classifier can't place is refused rather than filed under a catch-all."""
     if epub_path.suffix.lower() in _LEGACY_EXTENSIONS:
         metadata, chapters = extract_book_from_mobi(str(epub_path))
     else:
@@ -198,7 +206,11 @@ def add_book_to_site(site_dir: Path, epub_path: Path, used_ids: set[int]) -> dic
     book_title = metadata["title"] if _looks_like_real_title(metadata["title"]) else epub_path.stem
     book_title = _strip_title_tags(book_title)
     author = metadata["author"]
-    category = classify(book_title, metadata.get("description", "") + " " + _genre_hint(chapters))
+    if category is None:
+        category = classify(book_title, metadata.get("description", "") + " " + _genre_hint(chapters))
+        if category is None:
+            raise ValueError(f"can't guess a category for {book_title!r} — pick one by hand")
+    _check_category(category)
 
     book_id = max(used_ids, default=0) + 1
     used_ids.add(book_id)
@@ -261,6 +273,7 @@ def add_book_to_site(site_dir: Path, epub_path: Path, used_ids: set[int]) -> dic
 def write_index(site_dir: Path, manifest: list[dict]) -> None:
     books_by_category: dict[str, list[dict]] = {}
     for entry in manifest:
+        _check_category(entry["category"])
         books_by_category.setdefault(entry["category"], []).append(entry)
     # A fresh timestamp on every write_index() call (bulk build AND live
     # /import both go through this one function) — version-check.js polls
