@@ -28,6 +28,7 @@ import progress_log
 import translation
 from book_renderer import _CSS
 from build_library import _LEGACY_EXTENSIONS, add_book_to_site, write_index
+from classify import CATEGORIES
 
 _ALLOWED_IMPORT_EXTENSIONS = {".epub"} | _LEGACY_EXTENSIONS
 
@@ -170,7 +171,10 @@ _IMPORT_PAGE = """<!doctype html>
   <form method="post" action="/import" enctype="multipart/form-data">
     <label for="ebook">File ebook</label>
     <input type="file" id="ebook" name="ebook" accept=".epub,.prc,.mobi,.azw3" required>
-    <div class="hint">Hỗ trợ .epub, .prc, .mobi, .azw3 — thể loại được đoán tự động từ tiêu đề/mô tả.</div>
+    <div class="hint">Hỗ trợ .epub, .prc, .mobi, .azw3.</div>
+    <label for="category">Thể loại</label>
+    <select id="category" name="category">{category_options}</select>
+    <div class="hint">Tự động: đoán từ tiêu đề/mô tả — không đoán được thì báo lỗi để chọn tay.</div>
     <button type="submit">Tải lên &amp; thêm vào thư viện</button>
   </form>
 </div>
@@ -179,10 +183,18 @@ _IMPORT_PAGE = """<!doctype html>
 """
 
 
+def _import_page(msg_html: str, category: str = "") -> str:
+    options = ['<option value="">Tự động</option>'] + [
+        f'<option value="{html.escape(c)}"{" selected" if c == category else ""}>{html.escape(c)}</option>'
+        for c in CATEGORIES
+    ]
+    return _IMPORT_PAGE.format(pwa_head=_PWA_HEAD, css=_CSS, msg_html=msg_html, category_options="".join(options))
+
+
 @app.route("/import", methods=["GET"])
 @require_auth
 def import_form():
-    return _IMPORT_PAGE.format(pwa_head=_PWA_HEAD, css=_CSS, msg_html="")
+    return _import_page("")
 
 
 @app.route("/import", methods=["POST"])
@@ -190,16 +202,12 @@ def import_form():
 def import_submit():
     f = request.files.get("ebook")
     if not f or not f.filename:
-        return _IMPORT_PAGE.format(
-            pwa_head=_PWA_HEAD, css=_CSS, msg_html='<div class="msg err">Chưa chọn file</div>'
-        )
+        return _import_page('<div class="msg err">Chưa chọn file</div>')
 
+    category = request.form.get("category") or None
     ext = Path(f.filename).suffix.lower()
     if ext not in _ALLOWED_IMPORT_EXTENSIONS:
-        return _IMPORT_PAGE.format(
-            pwa_head=_PWA_HEAD, css=_CSS,
-            msg_html=f'<div class="msg err">Định dạng {html.escape(ext)} không được hỗ trợ</div>',
-        )
+        return _import_page(f'<div class="msg err">Định dạng {html.escape(ext)} không được hỗ trợ</div>', category or "")
 
     site_dir = Path(SITE_DIR)
     manifest_path = site_dir / "books.json"
@@ -214,11 +222,9 @@ def import_submit():
         tmp_path = Path(tmp) / f.filename
         f.save(tmp_path)
         try:
-            entry = add_book_to_site(site_dir, tmp_path, used_ids)
+            entry = add_book_to_site(site_dir, tmp_path, used_ids, category=category)
         except Exception as e:
-            return _IMPORT_PAGE.format(
-                pwa_head=_PWA_HEAD, css=_CSS, msg_html=f'<div class="msg err">Lỗi: {html.escape(str(e))}</div>'
-            )
+            return _import_page(f'<div class="msg err">Lỗi: {html.escape(str(e))}</div>', category or "")
 
     manifest.append(entry)
     write_index(site_dir, manifest)
