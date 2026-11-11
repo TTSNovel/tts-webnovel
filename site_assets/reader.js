@@ -1748,6 +1748,11 @@
     const wasActive = active;
     if (wasActive) stop();
     nextChapterPrefetch = null; // was for the old currentChapterNum + 1, now stale
+    // Right away, not only once goToChapter has the new chapter on screen —
+    // its fetch (and translation, if on) can take a few seconds, and a tap
+    // that visibly does nothing until then reads as ignored. Also cuts off
+    // any smooth scroll still following the old chapter's last sentence.
+    window.scrollTo({ top: 0, behavior: 'instant' });
 
     try {
       await goToChapter(num);
