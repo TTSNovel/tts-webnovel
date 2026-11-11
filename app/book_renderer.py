@@ -139,6 +139,16 @@ a { color: inherit; text-decoration: none; }
   background: var(--accent); color: var(--accent-text); font-size: 1.05rem;
 }
 .category { margin: 2rem 0; }
+.category[hidden] { display: none; }
+/* categories.html: one chip per category, jumping to its section */
+.category-chips { display: flex; gap: .4rem; overflow-x: auto; scrollbar-width: none; }
+.category-chips::-webkit-scrollbar { display: none; }
+.category-chips a {
+  flex: none; padding: .3rem .75rem; border-radius: 999px; font-size: .8rem;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text); white-space: nowrap;
+}
+.category-chips a:hover { background: var(--hover); }
+#categories-wrap .category { scroll-margin-top: 9rem; }
 .category h2 {
   font-size: 1.05rem; margin: 0 0 1rem; padding-left: .6rem;
   border-left: 4px solid var(--accent);
@@ -510,6 +520,7 @@ _INDEX_PAGE = """<!doctype html>
   <div class="site-topbar-row">
     <h1>📚 Thư viện truyện</h1>
     <div class="site-actions">
+      <a class="import-link" href="/categories.html" title="Thể loại">🏷️</a>
       <a class="import-link" href="/download.html" title="Đã tải xuống">📥</a>
       <a class="import-link" href="/import" title="Thêm truyện">➕</a>
     </div>
@@ -524,11 +535,51 @@ _INDEX_PAGE = """<!doctype html>
   ">
 </div>
 <div class="wrap" id="home-wrap">
-{categories}
+  <section class="category">
+    <h2>Tất cả</h2>
+    <div class="book-grid">
+{cards}
+    </div>
+  </section>
 </div>
 <script src="/assets/download.js"></script>
 <script src="/assets/progress.js"></script>
 <script src="/assets/version-check.js"></script>
+</body>
+</html>
+"""
+
+_CATEGORIES_PAGE = """<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>Thể loại</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+{pwa_head}
+<style>{css}</style>
+</head>
+<body>
+<div class="site-topbar">
+  <div class="site-topbar-row">
+    <a class="import-link" href="/" title="Trang chủ">‹</a>
+    <h1>🏷️ Thể loại</h1>
+  </div>
+  <input class="site-search" type="search" placeholder="Tìm truyện…" oninput="
+    document.querySelectorAll('.book-card').forEach(function(el){{
+      el.hidden = !el.dataset.title.includes(this.value.toLowerCase());
+    }}, this);
+    document.querySelectorAll('.category').forEach(function(cat){{
+      cat.hidden = !cat.querySelector('.book-card:not([hidden])');
+    }});
+  ">
+  <nav class="category-chips">
+{chips}
+  </nav>
+</div>
+<div class="wrap" id="categories-wrap">
+{categories}
+</div>
+<script src="/assets/progress.js"></script>
 </body>
 </html>
 """
@@ -600,30 +651,48 @@ def render_book_page(
     )
 
 
-def render_index_page(books_by_category: dict[str, list[dict]], version: str = "") -> str:
-    category_blocks = []
-    for category in sorted(books_by_category):
-        # books.json order = the order books were added (same order the iOS
-        # app's library list shows), not alphabetical.
-        books = books_by_category[category]
-        cards = []
-        for b in books:
-            # Always emit the .author span, even blank — its CSS reserves a
-            # fixed one-line height (see book-card .author), so an authorless
-            # book doesn't pull .meta up a line and throw off row alignment
-            # against its siblings that do have one.
-            author_html = f'<span class="author">{html.escape(b["author"])}</span>' if b.get("author") else '<span class="author"></span>'
-            cover_url = f'books/{b["id"]}/{b["cover"]}' if b.get("cover") else None
-            cards.append(_BOOK_CARD.format(
-                id=b["id"],
-                title=html.escape(b["title"]),
-                title_lower=html.escape(b["title"].lower()),
-                cover_html=cover_html(b["title"], cover_url, defer=True),
-                author_html=author_html,
-                n=b["n"],
-            ))
-        category_blocks.append(
-            f'  <section class="category">\n    <h2>{html.escape(category)}</h2>\n'
-            f'    <div class="book-grid">\n' + "\n".join(cards) + "\n    </div>\n  </section>"
+def _render_book_card(b: dict, defer: bool) -> str:
+    # Always emit the .author span, even blank — its CSS reserves a
+    # fixed one-line height (see book-card .author), so an authorless
+    # book doesn't pull .meta up a line and throw off row alignment
+    # against its siblings that do have one.
+    author_html = f'<span class="author">{html.escape(b["author"])}</span>' if b.get("author") else '<span class="author"></span>'
+    cover_url = f'books/{b["id"]}/{b["cover"]}' if b.get("cover") else None
+    return _BOOK_CARD.format(
+        id=b["id"],
+        title=html.escape(b["title"]),
+        title_lower=html.escape(b["title"].lower()),
+        cover_html=cover_html(b["title"], cover_url, defer=defer),
+        author_html=author_html,
+        n=b["n"],
+    )
+
+
+def render_index_page(books: list[dict], version: str = "") -> str:
+    """Home: one flat grid in books.json order (= the order books were
+    added), the same list the iOS app's library shows. Grouping by
+    category lives on its own page — see render_categories_page."""
+    cards = "\n".join(_render_book_card(b, defer=True) for b in books)
+    return _INDEX_PAGE.format(css=_CSS, pwa_head=_PWA_HEAD, cards=cards, version=version)
+
+
+def render_categories_page(books: list[dict]) -> str:
+    """categories.html: books grouped by category (categories A→Z, books
+    within each in the order they were added). Covers load directly —
+    download.js's deferred-cover reveal only runs on the home page."""
+    books_by_category: dict[str, list[dict]] = {}
+    for b in books:
+        books_by_category.setdefault(b["category"], []).append(b)
+    chips, blocks = [], []
+    for i, category in enumerate(sorted(books_by_category)):
+        group = books_by_category[category]
+        name = html.escape(category)
+        chips.append(f'    <a href="#cat-{i}">{name} ({len(group)})</a>')
+        cards = "\n".join(_render_book_card(b, defer=False) for b in group)
+        blocks.append(
+            f'  <section class="category" id="cat-{i}">\n    <h2>{name}</h2>\n'
+            f'    <div class="book-grid">\n' + cards + "\n    </div>\n  </section>"
         )
-    return _INDEX_PAGE.format(css=_CSS, pwa_head=_PWA_HEAD, categories="\n".join(category_blocks), version=version)
+    return _CATEGORIES_PAGE.format(
+        css=_CSS, pwa_head=_PWA_HEAD, chips="\n".join(chips), categories="\n".join(blocks)
+    )
