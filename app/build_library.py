@@ -2,7 +2,8 @@
 
 Layout (app-shell pattern — see book_renderer.py's _CHAPTER_SHELL docstring
 for why chapter pages are split this way):
-  site/index.html                       — home, books grouped by category
+  site/index.html                       — home, every book in the order added
+  site/categories.html                  — books grouped by category
   site/books.json                       — manifest: [{id, title, author, category, n}]
   site/chapter-shell.html               — the ONE page served for every chapter URL
   site/books/<id>/index.html            — one book: chapter list
@@ -40,6 +41,7 @@ from book_renderer import (
     render_book_page,
     render_chapter_fragment,
     render_chapter_shell,
+    render_categories_page,
     render_chapter_titles,
     render_index_page,
 )
@@ -271,19 +273,44 @@ def add_book_to_site(site_dir: Path, epub_path: Path, used_ids: set[int], catego
 
 
 def write_index(site_dir: Path, manifest: list[dict]) -> None:
-    books_by_category: dict[str, list[dict]] = {}
     for entry in manifest:
         _check_category(entry["category"])
-        books_by_category.setdefault(entry["category"], []).append(entry)
     # A fresh timestamp on every write_index() call (bulk build AND live
     # /import both go through this one function) — version-check.js polls
     # this and reloads the home page when it changes, so a client sees a
     # newly-imported book without needing a manual hard-refresh to bust
     # whatever cache is sitting between it and index.html.
     version = str(int(time.time()))
-    (site_dir / "index.html").write_text(render_index_page(books_by_category, version=version), encoding="utf-8")
+    (site_dir / "index.html").write_text(render_index_page(manifest, version=version), encoding="utf-8")
+    (site_dir / "categories.html").write_text(render_categories_page(manifest), encoding="utf-8")
     (site_dir / "books.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     (site_dir / "version.json").write_text(json.dumps({"v": version}), encoding="utf-8")
+
+
+def refresh_index_if_stale(site_dir: Path) -> bool:
+    """Re-render index.html/categories.html from books.json when what's on
+    disk no longer matches the current templates — those pages are static
+    files on the bucket, otherwise only rewritten by the next /import, so a
+    deploy that changes their layout would sit unseen until then. Compares
+    against the page rendered with the *current* version so an unchanged
+    layout writes nothing (and doesn't make every open tab reload)."""
+    manifest_path = site_dir / "books.json"
+    if not manifest_path.exists():
+        return False
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        version = json.loads((site_dir / "version.json").read_text(encoding="utf-8"))["v"]
+    except (OSError, ValueError, KeyError):
+        version = ""
+    index_path, categories_path = site_dir / "index.html", site_dir / "categories.html"
+    current = (
+        index_path.read_text(encoding="utf-8") if index_path.exists() else None,
+        categories_path.read_text(encoding="utf-8") if categories_path.exists() else None,
+    )
+    if current == (render_index_page(manifest, version=version), render_categories_page(manifest)):
+        return False
+    write_index(site_dir, manifest)
+    return True
 
 
 def _write_piper_offline_js(site_assets: Path, assets_dir: Path) -> None:

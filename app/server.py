@@ -27,7 +27,7 @@ from flask import Flask, Response, abort, redirect, request, send_from_directory
 import progress_log
 import translation
 from book_renderer import _CSS
-from build_library import _LEGACY_EXTENSIONS, add_book_to_site, write_index
+from build_library import _LEGACY_EXTENSIONS, add_book_to_site, refresh_index_if_stale, write_index
 from classify import CATEGORIES
 
 _ALLOWED_IMPORT_EXTENSIONS = {".epub"} | _LEGACY_EXTENSIONS
@@ -56,6 +56,15 @@ app.permanent_session_lifetime = timedelta(days=30)
 # source files run ~33MB); this just keeps an oversized upload from being
 # buffered into memory in full before Flask even looks at it.
 app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024
+
+# Home/categories pages are static files on the bucket — re-render them on
+# boot if this deploy changed their templates (no-op otherwise). Best-effort:
+# a failure here must not keep the service from starting.
+try:
+    if refresh_index_if_stale(Path(SITE_DIR)):
+        app.logger.warning("refreshed index.html/categories.html from books.json")
+except Exception as e:
+    app.logger.error("index refresh failed: %s", e)
 
 _PWA_HEAD = """<link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/assets/icons/icon-192.png" type="image/png">
