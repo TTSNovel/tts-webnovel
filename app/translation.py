@@ -19,7 +19,7 @@ Soft caps, checked before every call that would cost something: Google is
 held to GOOGLE_TRANSLATE_MONTHLY_CHARS per calendar month (Pacific time, like
 Google's own billing month) — just past the 500k free characters — and
 Gemini to GEMINI_DAILY_REQUESTS per day (Pacific, when Google resets the free
-tier's 500 requests/day). Over a cap → LimitReached (HTTP 429). The hard caps
+tier's 500 requests/day). Over a cap → LimitReached (HTTP 429, message shown in the reader). The hard caps
 are Google's: the Translation quota (tts-pipeline-infra billing.tf) and the
 Gemini key living in a project without billing (free tier only). Counters are
 best-effort (read-modify-write on the bucket, several Cloud Run instances).
@@ -483,10 +483,10 @@ def _charge(site_dir, engine, amount):
     now = _pacific_now()
     if engine == "gemini":
         period, limit, unit = now.strftime("%Y-%m-%d"), GEMINI_DAILY_REQUESTS, "requests"
-        msg = f"Gemini đã dùng hết {limit} lượt miễn phí hôm nay (đặt lại lúc 0h giờ Pacific)"
+        msg = f"Gemini has used today's {limit} free requests (resets at midnight Pacific time)"
     else:
         period, limit, unit = now.strftime("%Y-%m"), GOOGLE_MONTHLY_CHARS, "chars"
-        msg = f"Google Translate đã chạm giới hạn {limit:,} ký tự tháng này"
+        msg = f"Google Translate reached this month's {limit:,}-character limit"
     with _usage_lock:
         usage = load_usage(site_dir)
         entry = usage.get(engine) or {}
@@ -566,7 +566,7 @@ def gemini_translate(texts, source, target, glossary=None):
         f"{_GEMINI_API}/{GEMINI_MODEL}:generateContent", json=body, headers={"x-goog-api-key": key}, timeout=120
     )
     if resp.status_code == 429:
-        raise LimitReached("Gemini đang quá giới hạn miễn phí (15 lượt/phút, 500 lượt/ngày) — thử lại sau")
+        raise LimitReached("Gemini is over its free-tier limit (15 requests/min, 500/day) — try again later")
     if not resp.ok:
         raise TranslationError(f"Gemini generateContent failed: {resp.status_code} {resp.text[:300]}")
     try:

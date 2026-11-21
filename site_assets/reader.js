@@ -727,7 +727,7 @@
             // on this same Audio, which then fires onended normally).
             paused = true;
             updatePlayBtn();
-            showReaderError('Đã chặn tự phát — nhấn ▶ để tiếp tục', false);
+            showReaderError('Autoplay was blocked — press ▶ to continue', false);
           } else {
             reject(err);
           }
@@ -837,8 +837,14 @@
     return localStorage.getItem('reader.autoTranslate') !== '0';
   }
 
+  // Used until the user picks an engine: Chrome's free offline translator
+  // where the browser has one, else Gemini (free tier, server-side).
+  function defaultTranslationEngineKey() {
+    return 'Translator' in self ? 'browser' : 'gemini';
+  }
+
   function currentTranslationEngine() {
-    return TRANSLATION_ENGINES[localStorage.getItem('reader.translateEngine')] || TRANSLATION_ENGINES.vietphrase;
+    return TRANSLATION_ENGINES[localStorage.getItem('reader.translateEngine')] || TRANSLATION_ENGINES[defaultTranslationEngineKey()];
   }
 
   function textOfHtml(html) {
@@ -887,7 +893,7 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ book_id: parseInt(bookId, 10), chapter: num, source, target: TRANSLATE_TARGET, texts, engine }),
     });
-    // 429 = a soft cap (server says which, in Vietnamese).
+    // 429 = a soft cap (the server's text says which).
     if (resp.status === 429) throw new Error(await resp.text());
     if (!resp.ok) throw new Error(`translate failed: ${resp.status}`);
     return (await resp.json()).translations;
@@ -936,10 +942,10 @@
   function browserTranslator(source) {
     if (!browserTranslators[source]) {
       browserTranslators[source] = (async () => {
-        if (!('Translator' in self)) throw new Error('Trình duyệt này không có bộ dịch offline (cần Chrome 138+ trên máy tính)');
+        if (!('Translator' in self)) throw new Error('This browser has no offline translator (needs desktop Chrome 138+)');
         const pair = { sourceLanguage: source, targetLanguage: TRANSLATE_TARGET };
         const availability = await Translator.availability(pair);
-        if (availability === 'unavailable') throw new Error(`Bộ dịch offline không hỗ trợ ${source}→${TRANSLATE_TARGET}`);
+        if (availability === 'unavailable') throw new Error(`The offline translator doesn't support ${source}→${TRANSLATE_TARGET}`);
         return Translator.create(pair);
       })();
       // A failed create (e.g. no user click yet for the download) is retried next time.
@@ -1031,8 +1037,13 @@
   }
 
   TRANSLATION_ENGINES = {
+    browser: {
+      name: 'Google Translate offline (Chrome)',
+      needsTranslation: (text) => detectSourceLanguage(text) !== null,
+      translate: browserTranslate,
+    },
     vietphrase: {
-      name: 'VietPhrase (Hán Việt)',
+      name: 'VietPhrase (Sino-Vietnamese)',
       needsTranslation: (text) => !!window.HanViet && window.HanViet.needsTranslation(text),
       translate: async (container) => {
         await window.HanViet.load();
@@ -1040,19 +1051,14 @@
       },
     },
     google: {
-      name: 'Google Translate',
+      name: 'Google Translate (cloud)',
       needsTranslation: (text) => detectSourceLanguage(text) !== null,
       translate: googleTranslate,
     },
     gemini: {
-      name: 'Gemini Flash-Lite (miễn phí, 500 lượt/ngày)',
+      name: 'Gemini Flash-Lite (free, 500/day)',
       needsTranslation: (text) => detectSourceLanguage(text) !== null,
       translate: (container, num) => googleTranslate(container, num, 'gemini'),
-    },
-    browser: {
-      name: 'Trình duyệt (offline, miễn phí)',
-      needsTranslation: (text) => detectSourceLanguage(text) !== null,
-      translate: browserTranslate,
     },
   };
 
@@ -1096,19 +1102,19 @@
     overlay.hidden = true;
     overlay.innerHTML = `
       <div class="glossary-box" role="dialog" aria-label="Glossary">
-        <div class="glossary-head"><h2>Glossary</h2><button class="icon-btn" data-g="close" title="Đóng">✕</button></div>
+        <div class="glossary-head"><h2>Glossary</h2><button class="icon-btn" data-g="close" title="Close">✕</button></div>
         <div class="glossary-tabs">
           <button data-g="tab" data-scope="book"></button>
           <button data-g="tab" data-scope="shared"></button>
         </div>
         <div class="glossary-tools">
-          <input type="search" data-g="filter" placeholder="Tìm thuật ngữ…">
-          <button class="glossary-btn ghost" data-g="add">+ Thêm</button>
+          <input type="search" data-g="filter" placeholder="Search terms…">
+          <button class="glossary-btn ghost" data-g="add">+ Add</button>
         </div>
         <div class="glossary-list" data-g="list"></div>
         <div class="glossary-foot">
-          <span class="status" data-g="status">Để trống bản dịch = giữ nguyên từ gốc.</span>
-          <button class="glossary-btn" data-g="save">Lưu</button>
+          <span class="status" data-g="status">Empty translation = keep the term as is.</span>
+          <button class="glossary-btn" data-g="save">Save</button>
         </div>
       </div>`;
     document.body.appendChild(overlay);
@@ -1161,7 +1167,7 @@
 
   function markGlossaryDirty() {
     glossary.dirty = true;
-    setGlossaryStatus('Chưa lưu thay đổi.');
+    setGlossaryStatus('Unsaved changes.');
   }
 
   function setGlossaryStatus(text, isError) {
@@ -1174,7 +1180,7 @@
     overlay.querySelectorAll('[data-g="tab"]').forEach((btn) => {
       const scopeId = btn.dataset.scope === 'book' ? parseInt(bookId, 10) : null;
       const n = glossary.terms.filter((t) => t.book_id === scopeId).length;
-      btn.textContent = `${btn.dataset.scope === 'book' ? 'Riêng truyện này' : 'Chung (mọi truyện)'} (${n})`;
+      btn.textContent = `${btn.dataset.scope === 'book' ? 'This book only' : 'Shared (all books)'} (${n})`;
       btn.classList.toggle('on', btn.dataset.scope === glossary.scope);
     });
     const scopeId = glossaryScopeBookId();
@@ -1183,14 +1189,14 @@
       if (t.book_id !== scopeId) return;
       if (glossary.filter && !`${t.source} ${t.target}`.toLowerCase().includes(glossary.filter)) return;
       rows.push(`<div class="glossary-row" data-i="${i}">
-        <input data-field="source" value="${escapeAttr(t.source)}" placeholder="Thuật ngữ gốc (VD: Dao)">
-        <input data-field="target" value="${escapeAttr(t.target === t.source ? '' : t.target)}" placeholder="${escapeAttr(t.source) || 'Bản dịch'} (giữ nguyên)">
-        <button class="icon-btn" data-g="remove" title="Xoá">✕</button>
+        <input data-field="source" value="${escapeAttr(t.source)}" placeholder="Source term (e.g. Dao)">
+        <input data-field="target" value="${escapeAttr(t.target === t.source ? '' : t.target)}" placeholder="${escapeAttr(t.source) || 'Translation'} (kept as is)">
+        <button class="icon-btn" data-g="remove" title="Remove">✕</button>
       </div>`);
     });
     list.innerHTML = rows.length
       ? rows.join('')
-      : `<div class="glossary-empty">${glossary.loaded ? 'Chưa có thuật ngữ nào.' : 'Đang tải…'}</div>`;
+      : `<div class="glossary-empty">${glossary.loaded ? 'No terms yet.' : 'Loading…'}</div>`;
   }
 
   function escapeAttr(str) {
@@ -1208,9 +1214,9 @@
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       glossary.terms = (await resp.json()).terms;
       glossary.loaded = true;
-      setGlossaryStatus('Để trống bản dịch = giữ nguyên từ gốc.');
+      setGlossaryStatus('Empty translation = keep the term as is.');
     } catch (e) {
-      setGlossaryStatus(`Không tải được glossary: ${(e && e.message) || e}`, true);
+      setGlossaryStatus(`Couldn't load the glossary: ${(e && e.message) || e}`, true);
     }
     renderGlossary();
   }
@@ -1222,7 +1228,7 @@
   async function saveGlossary() {
     const terms = glossary.terms.filter((t) => t.source.trim());
     glossary.el.save.disabled = true;
-    setGlossaryStatus('Đang lưu và cập nhật lên Google…');
+    setGlossaryStatus('Saving and publishing to Google…');
     try {
       const resp = await fetch('/api/glossary', {
         method: 'POST',
@@ -1232,7 +1238,7 @@
       if (!resp.ok) throw new Error((await resp.text()) || `HTTP ${resp.status}`);
       glossary.terms = (await resp.json()).terms;
       glossary.dirty = false;
-      setGlossaryStatus('Đã lưu. Chương đang mở được dịch lại.');
+      setGlossaryStatus('Saved. The open chapter is being re-translated.');
       renderGlossary();
       // The open chapter re-translates against the new glossary (the server
       // treats segments stored under the old one as missing; the browser
@@ -1244,7 +1250,7 @@
       }
       nextChapterPrefetch = null;
     } catch (e) {
-      setGlossaryStatus(`Lưu thất bại: ${(e && e.message) || e}`, true);
+      setGlossaryStatus(`Save failed: ${(e && e.message) || e}`, true);
     } finally {
       glossary.el.save.disabled = false;
     }
@@ -1472,16 +1478,16 @@
     overlay.hidden = true;
     overlay.innerHTML = `
       <div class="glossary-box" role="dialog" aria-label="Filter Words">
-        <div class="glossary-head"><h2>Filter Words</h2><button class="icon-btn" data-f="close" title="Đóng">✕</button></div>
+        <div class="glossary-head"><h2>Filter Words</h2><button class="icon-btn" data-f="close" title="Close">✕</button></div>
         <div class="glossary-tools">
           <span style="flex:1"></span>
-          <button class="glossary-btn ghost" data-f="defaults" title="Thêm lại các quy tắc mặc định đã xoá">Mặc định</button>
-          <button class="glossary-btn ghost" data-f="add">+ Thêm</button>
+          <button class="glossary-btn ghost" data-f="defaults" title="Re-add the default rules you removed">Defaults</button>
+          <button class="glossary-btn ghost" data-f="add">+ Add</button>
         </div>
         <div class="glossary-list" data-f="list"></div>
         <div class="glossary-foot">
           <span class="status" data-f="status"></span>
-          <button class="glossary-btn" data-f="save">Lưu</button>
+          <button class="glossary-btn" data-f="save">Save</button>
         </div>
       </div>`;
     document.body.appendChild(overlay);
@@ -1501,11 +1507,11 @@
     q('defaults').addEventListener('click', () => {
       const have = new Set(filterWords.draft.map((r) => String(r.id).toUpperCase()));
       const missing = DEFAULT_FILTER_WORDS.filter((r) => !have.has(r.id));
-      if (!missing.length) return setFilterWordsStatus('Đã có đủ quy tắc mặc định.');
+      if (!missing.length) return setFilterWordsStatus('All default rules are already there.');
       filterWords.draft.push(...missing.map((r) => ({ ...r })));
       filterWords.dirty = true;
       renderFilterWords();
-      setFilterWordsStatus(`Đã thêm ${missing.length} quy tắc mặc định — bấm Lưu để áp dụng.`);
+      setFilterWordsStatus(`Added ${missing.length} default rules — press Save to apply.`);
     });
     filterWords.el.save.addEventListener('click', saveFilterWords);
     // Inputs are re-rendered on add/remove, so edits are read back from the
@@ -1536,15 +1542,15 @@
   function renderFilterWords() {
     const rows = filterWords.draft.map(
       (r, i) => `<div class="fw-row${r.pattern && !compileFilterRule(r) ? ' invalid' : ''}" data-i="${i}">
-        <input class="fw-pattern" data-field="pattern" value="${escapeAttr(r.pattern)}" placeholder="Từ hoặc regex cần lọc">
+        <input class="fw-pattern" data-field="pattern" value="${escapeAttr(r.pattern)}" placeholder="Word or regex to filter">
         <label class="fw-regex"><input type="checkbox" data-field="is_regex"${r.is_regex ? ' checked' : ''}>Regex</label>
-        <button class="icon-btn" data-f="remove" title="Xoá">✕</button>
-        <input class="fw-label" data-field="label" value="${escapeAttr(r.label)}" placeholder="Tên (không bắt buộc)">
+        <button class="icon-btn" data-f="remove" title="Remove">✕</button>
+        <input class="fw-label" data-field="label" value="${escapeAttr(r.label)}" placeholder="Name (optional)">
       </div>`
     );
     filterWords.el.list.innerHTML = rows.length
       ? rows.join('')
-      : `<div class="glossary-empty">${filterWords.loaded ? 'Chưa có quy tắc nào.' : 'Đang tải…'}</div>`;
+      : `<div class="glossary-empty">${filterWords.loaded ? 'No rules yet.' : 'Loading…'}</div>`;
   }
 
   async function openFilterWordsEditor() {
@@ -1554,11 +1560,11 @@
     filterWords.loaded = false;
     filterWords.draft = filterWords.rules.map((r) => ({ ...r }));
     renderFilterWords();
-    setFilterWordsStatus('Đang tải…');
+    setFilterWordsStatus('Loading…');
     if (await refreshFilterWords()) refilterChapter();
     filterWords.draft = filterWords.rules.map((r) => ({ ...r }));
     filterWords.loaded = true;
-    setFilterWordsStatus('Chữ khớp quy tắc bị bỏ khỏi chương — không hiển thị, không đọc.');
+    setFilterWordsStatus('Matching text is removed from the chapter — neither shown nor read aloud.');
     renderFilterWords();
   }
 
@@ -1576,16 +1582,16 @@
         ...(r.label && r.label.trim() ? { label: r.label.trim() } : {}),
       }));
     const bad = rules.find((r) => !compileFilterRule(r));
-    if (bad) return setFilterWordsStatus(`Regex không hợp lệ: ${bad.pattern}`, true);
+    if (bad) return setFilterWordsStatus(`Invalid regex: ${bad.pattern}`, true);
     filterWords.el.save.disabled = true;
-    setFilterWordsStatus('Đang lưu…');
+    setFilterWordsStatus('Saving…');
     try {
       await postFilterWords(rules);
-      setFilterWordsStatus('Đã lưu. Chương đang mở đã được lọc lại.');
+      setFilterWordsStatus('Saved. The open chapter has been re-filtered.');
     } catch (e) {
       // Still applied here — only the sync to other devices failed.
       setFilterWords(rules);
-      setFilterWordsStatus(`Đã áp dụng trên trình duyệt này nhưng chưa đồng bộ lên server: ${(e && e.message) || e}`, true);
+      setFilterWordsStatus(`Applied in this browser but not synced to the server: ${(e && e.message) || e}`, true);
     } finally {
       filterWords.el.save.disabled = false;
     }
@@ -1628,7 +1634,7 @@
         if (generation !== renderGeneration) return;
         showingTranslation = false;
         updateTranslateBtn();
-        showReaderError(`Không dịch được chương này — đang hiển thị bản gốc. (${(e && e.message) || e})`);
+        showReaderError(`Couldn't translate this chapter — showing the original. (${(e && e.message) || e})`);
         return;
       } finally {
         if (els && generation === renderGeneration) els.translateToggle.classList.remove('busy');
@@ -1773,7 +1779,7 @@
           // blew through the rest of the chapter in seconds with nothing
           // ever actually played. index is left where it is so pressing
           // ▶ again retries this exact sentence instead of skipping it.
-          showReaderError(`Lỗi đọc câu ${i + 1}: ${(e && e.message) || e}`);
+          showReaderError(`Error reading sentence ${i + 1}: ${(e && e.message) || e}`);
           clearAutoStopState();
           stop();
           return;
@@ -1809,7 +1815,7 @@
         await goToChapter(nextNum, prefetched?.html ?? undefined, prefetched?.translatedHtml);
       } catch (e) {
         console.error('reader.js: auto-advance failed to load next chapter ::', (e && e.message) || e);
-        showReaderError(`Lỗi tải chương tiếp theo: ${(e && e.message) || e}`);
+        showReaderError(`Error loading the next chapter: ${(e && e.message) || e}`);
         break;
       }
       dropPreloadedAudio(); // cached audio was keyed by the old chapter's sentence indices
@@ -1983,10 +1989,10 @@
     els.piperOfflineProgress.hidden = true;
     const downloaded = await window.PiperOffline.isDownloaded();
     if (downloaded) {
-      els.piperOfflineStatus.textContent = 'Đã tải — dùng được offline';
+      els.piperOfflineStatus.textContent = 'Downloaded — works offline';
       els.piperOfflineBtn.hidden = false;
       els.piperOfflineBtn.disabled = false;
-      els.piperOfflineBtn.textContent = 'Xoá model';
+      els.piperOfflineBtn.textContent = 'Delete model';
       // Load the model now (page load, or whenever this voice becomes
       // selected) instead of waiting for the first ▶ press to pay for it —
       // ensureModelLoaded() inside the worker is a no-op once already
@@ -1996,7 +2002,7 @@
         console.warn('reader.js: Piper offline warm-up failed ::', (e && e.message) || e);
       });
     } else {
-      els.piperOfflineStatus.textContent = 'Chưa tải — sẽ tự tải khi bấm ▶ (~93MB)';
+      els.piperOfflineStatus.textContent = 'Not downloaded — downloads when you press ▶ (~93MB)';
       els.piperOfflineBtn.hidden = true;
     }
   }
@@ -2012,19 +2018,19 @@
   // content-driven (see .reader-bar CSS), that made the whole centered
   // bar visibly shift left-right on every percentage update.
   function ensurePiperOfflineReady() {
-    if (!window.PiperOffline) return Promise.reject(new Error('Piper offline chưa sẵn sàng'));
+    if (!window.PiperOffline) return Promise.reject(new Error('Piper offline is not ready'));
     if (!piperOfflineDownloadPromise) {
       piperOfflineDownloadPromise = window.PiperOffline.isDownloaded().then((downloaded) => {
         if (downloaded) return;
         if (els) {
           els.piperOfflineBtn.hidden = true;
           els.piperOfflineProgress.hidden = false;
-          els.piperOfflineStatus.textContent = 'Đang tải model (~93MB)… 0%';
+          els.piperOfflineStatus.textContent = 'Downloading model (~93MB)… 0%';
         }
         return window.PiperOffline.download((loaded, total) => {
           const pct = total ? Math.round((loaded / total) * 100) : 0;
           if (els) {
-            els.piperOfflineStatus.textContent = `Đang tải model… ${pct}%`;
+            els.piperOfflineStatus.textContent = `Downloading model… ${pct}%`;
             els.piperOfflineProgress.querySelector('.dl-progress-bar').style.width = `${pct}%`;
           }
         });
@@ -2043,7 +2049,7 @@
         .catch((err) => {
           piperOfflineDownloadPromise = null; // let the next ▶ press retry
           if (els) {
-            els.piperOfflineStatus.textContent = 'Tải lỗi — bấm ▶ để thử lại';
+            els.piperOfflineStatus.textContent = 'Download failed — press ▶ to retry';
             els.piperOfflineProgress.hidden = true;
           }
           throw err;
@@ -2062,7 +2068,7 @@
         <span class="reader-preload" data-role="preload" title="Số câu đã tải trước">0 / 0</span>
       </span>
       <button class="reader-btn reader-btn-ghost reader-btn-lang" data-role="translateToggle" title="Dịch chương" hidden></button>
-      <button class="reader-btn reader-btn-ghost" data-role="settingsToggle" title="Cài đặt đọc">⚙</button>
+      <button class="reader-btn reader-btn-ghost" data-role="settingsToggle" title="Reader settings">⚙</button>
     `;
 
     const panel = document.createElement('div');
@@ -2070,7 +2076,7 @@
     panel.hidden = true;
     panel.innerHTML = `
       <div class="msg err" data-role="errorBox" hidden></div>
-      <label>Giọng đọc
+      <label>Voice
         <select data-role="model">
           <option value="piper_vi">Piper VN</option>
           <option value="google_tts">Google Cloud TTS</option>
@@ -2084,12 +2090,12 @@
         <button type="button" class="dl-btn" data-role="piperOfflineBtn"></button>
         <div class="dl-progress" data-role="piperOfflineProgress" hidden><div class="dl-progress-bar"></div></div>
       </div>
-      <label data-role="gwenSpeakerBox" hidden>Giọng Gwen-TTS
+      <label data-role="gwenSpeakerBox" hidden>Gwen-TTS voice
         <select data-role="gwenSpeaker">
           ${GWEN_SPEAKERS.map(([key, name]) => `<option value="${key}">${name}</option>`).join('')}
         </select>
       </label>
-      <label>Tốc độ
+      <label>Speed
         <select data-role="speed">
           <option value="0.85">0.85x</option>
           <option value="1">1x</option>
@@ -2098,34 +2104,34 @@
           <option value="1.5">1.5x</option>
         </select>
       </label>
-      <label>Cỡ chữ
+      <label>Font size
         <select data-role="fontSize">
-          <option value="0.85">Nhỏ</option>
-          <option value="1">Vừa</option>
-          <option value="1.15">Lớn</option>
-          <option value="1.3">Rất lớn</option>
-          <option value="1.5">Cực lớn</option>
+          <option value="0.85">Small</option>
+          <option value="1">Medium</option>
+          <option value="1.15">Large</option>
+          <option value="1.3">Extra large</option>
+          <option value="1.5">Huge</option>
         </select>
       </label>
-      <div class="reader-settings-heading">Dịch</div>
-      <label>Công cụ dịch
+      <div class="reader-settings-heading">Translation</div>
+      <label>Translation engine
         <select data-role="translateEngine">
           ${Object.entries(TRANSLATION_ENGINES).map(([key, e]) => `<option value="${key}">${e.name}</option>`).join('')}
         </select>
       </label>
-      <button type="button" class="dl-btn" data-role="glossaryOpen" title="Thuật ngữ cố định khi dịch bằng Google Translate, Gemini hoặc trình duyệt">Glossary…</button>
-      <div class="reader-settings-heading">Lọc</div>
-      <button type="button" class="dl-btn" data-role="filterWordsOpen" title="Bỏ link, quảng cáo, ghi chú… khỏi chương — không hiển thị, không đọc">Filter Words…</button>
+      <button type="button" class="dl-btn" data-role="glossaryOpen" title="Fixed term translations for Google Translate, Gemini and the offline translator">Glossary…</button>
+      <div class="reader-settings-heading">Filter</div>
+      <button type="button" class="dl-btn" data-role="filterWordsOpen" title="Remove links, ads, notes… from chapters — neither shown nor read aloud">Filter Words…</button>
       <label class="reader-settings-checkbox">
         <input type="checkbox" data-role="autoTranslate">
-        Tự động dịch chương không phải tiếng Việt
+        Auto-translate chapters that aren't in Vietnamese
       </label>
-      <div class="reader-settings-heading">Tự động</div>
+      <div class="reader-settings-heading">Automation</div>
       <label class="reader-settings-checkbox">
         <input type="checkbox" data-role="autoNext">
-        Tự động sang chương tiếp khi đọc xong
+        Go to the next chapter when this one ends
       </label>
-      <label>Tự dừng sau (phút, 0 = không bao giờ)
+      <label>Stop after (minutes, 0 = never)
         <input type="number" data-role="autoStopMinutes" min="0" max="600" step="5">
       </label>
     `;
@@ -2189,7 +2195,7 @@
 
     els.translateEngine.value = TRANSLATION_ENGINES[localStorage.getItem('reader.translateEngine')]
       ? localStorage.getItem('reader.translateEngine')
-      : 'vietphrase';
+      : defaultTranslationEngineKey();
     // Engines disagree on which chapters need translating (VietPhrase only
     // takes Chinese, Google anything not Vietnamese) — re-evaluate the open
     // chapter from scratch, same as loading it fresh.
@@ -2267,7 +2273,7 @@
         console.warn('reader.js: removeModel() resolved without throwing');
       } catch (e) {
         console.error('reader.js: xoá model Piper offline thất bại ::', (e && e.name) || typeof e, (e && e.message) || e);
-        els.piperOfflineStatus.textContent = `Xoá lỗi: ${(e && e.message) || e}`;
+        els.piperOfflineStatus.textContent = `Delete failed: ${(e && e.message) || e}`;
         els.piperOfflineBtn.disabled = false;
         return;
       }
