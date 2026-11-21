@@ -917,6 +917,115 @@
     console.log(`reader.js: translated ${texts.length} paragraphs (${source}→${TRANSLATE_TARGET}) in ${(performance.now() - t0).toFixed(0)}ms`);
   }
 
+  // ── Browser's on-device translator (Chrome's Translator API) ──────────────
+  // Free and offline once Chrome has downloaded the language pack (the first
+  // create() for a pair needs a user click — the engine select / VI button
+  // both count). Nothing goes to the server, so nothing is stored there
+  // either: a re-read chapter is translated again, which takes a moment but
+  // costs nothing. The model takes no glossary, so the same shared glossary
+  // as Google's is applied around it: every term (and the variants the
+  // server publishes for Google, see translation.term_variants) is swapped
+  // for a placeholder the model leaves alone, then for its translation.
+  const browserTranslators = {}; // source language -> Promise<Translator>
+  let browserGlossaryPromise = null; // Promise<[{source, target}]>, longest source first
+
+  function browserTranslator(source) {
+    if (!browserTranslators[source]) {
+      browserTranslators[source] = (async () => {
+        if (!('Translator' in self)) throw new Error('Trình duyệt này không có bộ dịch offline (cần Chrome 138+ trên máy tính)');
+        const pair = { sourceLanguage: source, targetLanguage: TRANSLATE_TARGET };
+        const availability = await Translator.availability(pair);
+        if (availability === 'unavailable') throw new Error(`Bộ dịch offline không hỗ trợ ${source}→${TRANSLATE_TARGET}`);
+        return Translator.create(pair);
+      })();
+      // A failed create (e.g. no user click yet for the download) is retried next time.
+      browserTranslators[source].catch(() => delete browserTranslators[source]);
+    }
+    return browserTranslators[source];
+  }
+
+  // JS twin of translation._other_number / term_variants.
+  function otherNumber(word) {
+    const lower = word.toLowerCase();
+    if (/(ss|us|is)$/.test(lower)) return word + 'es';
+    if (lower.endsWith('ies') && word.length > 4) return word.slice(0, -3) + 'y';
+    if (/(ches|shes|sses|xes|zes)$/.test(lower)) return word.slice(0, -2);
+    if (lower.endsWith('s')) return word.slice(0, -1);
+    if (/(ch|sh|x|z)$/.test(lower)) return word + 'es';
+    if (lower.endsWith('y') && word.length > 1 && !'aeiou'.includes(lower[word.length - 2])) return word.slice(0, -1) + 'ies';
+    return word + 's';
+  }
+
+  function termVariants(source) {
+    if (/[一-鿿]/.test(source)) return [source];
+    const forms = [source];
+    const m = source.match(/[A-Za-z]+$/);
+    if (m && m[0].length > 1) forms.push(source.slice(0, m.index) + otherNumber(m[0]));
+    forms.slice().forEach((f) => /^[a-z]/.test(f) && forms.push(f[0].toUpperCase() + f.slice(1)));
+    return [...new Set(forms)];
+  }
+
+  function browserGlossary() {
+    if (!browserGlossaryPromise) {
+      browserGlossaryPromise = fetch('/api/glossary')
+        .then((r) => (r.ok ? r.json() : { terms: [] }))
+        .then(({ terms }) => {
+          // Shared terms, then this book's — the book's win on the same source.
+          const byForm = new Map();
+          const id = parseInt(bookId, 10);
+          for (const own of [false, true]) {
+            for (const t of terms || []) {
+              if ((t.book_id === id) !== own || (t.book_id != null && t.book_id !== id)) continue;
+              const target = t.target.trim() || t.source;
+              termVariants(t.source).forEach((form) => byForm.set(form, target));
+            }
+          }
+          return [...byForm].map(([source, target]) => ({ source, target })).sort((a, b) => b.source.length - a.source.length);
+        })
+        .catch(() => []);
+    }
+    return browserGlossaryPromise;
+  }
+
+  function escapeRegExp(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  // "XQ<n>Z": what Chrome's model was seen to pass through untouched
+  // (brackets/numbers/xml-ish markers got split, dropped or translated).
+  function protectTerms(text, terms) {
+    const used = [];
+    for (const term of terms) {
+      if (!text.includes(term.source)) continue;
+      const edge = (ch) => (/[A-Za-z0-9]/.test(ch) ? (ch === term.source[0] ? '(?<![A-Za-z0-9])' : '(?![A-Za-z0-9])') : '');
+      const re = new RegExp(edge(term.source[0]) + escapeRegExp(term.source) + edge(term.source[term.source.length - 1]), 'g');
+      text = text.replace(re, () => {
+        used.push(term.target);
+        return `XQ${used.length - 1}Z`;
+      });
+    }
+    return { text, used };
+  }
+
+  function restoreTerms(text, used) {
+    return text.replace(/XQ\s?(\d+)\s?Z/gi, (whole, n) => (used[n] != null ? used[n] : whole));
+  }
+
+  async function browserTranslate(container) {
+    const nodes = translatableNodes(container);
+    const texts = nodes.map((node) => node.textContent.replace(/\s+/g, ' ').trim());
+    const source = detectSourceLanguage(texts.join(' '));
+    if (!source) return;
+    const [translator, terms] = await Promise.all([browserTranslator(source), browserGlossary()]);
+    const t0 = performance.now();
+    // One paragraph at a time — the API runs requests one after another anyway.
+    for (let i = 0; i < nodes.length; i++) {
+      const { text, used } = protectTerms(texts[i], terms);
+      nodes[i].textContent = restoreTerms(await translator.translate(text), used);
+    }
+    console.log(`reader.js: browser-translated ${texts.length} paragraphs (${source}→${TRANSLATE_TARGET}) in ${(performance.now() - t0).toFixed(0)}ms`);
+  }
+
   TRANSLATION_ENGINES = {
     vietphrase: {
       name: 'VietPhrase (Hán Việt)',
@@ -930,6 +1039,11 @@
       name: 'Google Translate',
       needsTranslation: (text) => detectSourceLanguage(text) !== null,
       translate: googleTranslate,
+    },
+    browser: {
+      name: 'Trình duyệt (offline, miễn phí)',
+      needsTranslation: (text) => detectSourceLanguage(text) !== null,
+      translate: browserTranslate,
     },
   };
 
@@ -1112,8 +1226,10 @@
       setGlossaryStatus('Đã lưu. Chương đang mở được dịch lại.');
       renderGlossary();
       // The open chapter re-translates against the new glossary (the server
-      // treats segments stored under the old one as missing).
-      if (showingTranslation && localStorage.getItem('reader.translateEngine') === 'google') {
+      // treats segments stored under the old one as missing; the browser
+      // engine just re-reads the list).
+      browserGlossaryPromise = null;
+      if (showingTranslation && ['google', 'browser'].includes(localStorage.getItem('reader.translateEngine'))) {
         chapterTranslatedHtml = null;
         rerenderChapter(true);
       }
@@ -1988,7 +2104,7 @@
           ${Object.entries(TRANSLATION_ENGINES).map(([key, e]) => `<option value="${key}">${e.name}</option>`).join('')}
         </select>
       </label>
-      <button type="button" class="dl-btn" data-role="glossaryOpen" title="Thuật ngữ cố định khi dịch bằng Google Translate">Glossary (Google Translate)…</button>
+      <button type="button" class="dl-btn" data-role="glossaryOpen" title="Thuật ngữ cố định khi dịch bằng Google Translate hoặc trình duyệt">Glossary…</button>
       <div class="reader-settings-heading">Lọc</div>
       <button type="button" class="dl-btn" data-role="filterWordsOpen" title="Bỏ link, quảng cáo, ghi chú… khỏi chương — không hiển thị, không đọc">Filter Words…</button>
       <label class="reader-settings-checkbox">
