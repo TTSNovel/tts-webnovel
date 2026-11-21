@@ -7,7 +7,22 @@ Store layout (under SITE_DIR, i.e. the GCS bucket mounted into Cloud Run):
 
   translations/glossary.json                          the glossary (edited via /api/glossary)
   translations/glossaries/<glossary id>.tsv           what's published to Google
-  translations/<book_id>/<src>-<tgt>/<chapter>.json   translated segments
+  translations/<book_id>/<src>-<tgt>/<chapter>.json   translated segments (Google)
+  translations/<book_id>/<src>-<tgt>-gemini/<ch>.json  translated segments (Gemini)
+  translations/usage.json                             soft-cap counters (see below)
+
+Two engines: Google Cloud Translation (NMT + published glossaries) and Gemini
+Flash-Lite (glossary given in the prompt — only the terms that occur in the
+request). Each has its own store, so switching engines never mixes them.
+
+Soft caps, checked before every call that would cost something: Google is
+held to GOOGLE_TRANSLATE_MONTHLY_CHARS per calendar month (Pacific time, like
+Google's own billing month) — just past the 500k free characters — and
+Gemini to GEMINI_DAILY_REQUESTS per day (Pacific, when Google resets the free
+tier's 500 requests/day). Over a cap → LimitReached (HTTP 429). The hard caps
+are Google's: the Translation quota (tts-pipeline-infra billing.tf) and the
+Gemini key living in a project without billing (free tier only). Counters are
+best-effort (read-modify-write on the bucket, several Cloud Run instances).
 
 Glossary: one list of terms that applies to every book, plus optional terms
 of a single book (e.g. "class" → "chức nghiệp" is right for a LitRPG, wrong
@@ -85,6 +100,10 @@ _glossary_cache = {}  # glossary id -> (fetched_at, revision or None)
 
 class TranslationError(Exception):
     pass
+
+
+class LimitReached(TranslationError):
+    """A soft cap (see module docstring) would be exceeded."""
 
 
 GLOSSARY_TARGET = "vi"
@@ -433,8 +452,128 @@ def google_translate(texts, source, target, glossary=None):
     return [item.get("translatedText", "") for item in items]
 
 
-def _chapter_path(site_dir, book_id, chapter, source, target):
-    return Path(site_dir) / "translations" / str(book_id) / f"{source}-{target}" / f"{chapter:04d}.json"
+# ── Soft caps ───────────────────────────────────────────────────────────────
+
+GOOGLE_MONTHLY_CHARS = int(os.environ.get("GOOGLE_TRANSLATE_MONTHLY_CHARS", "510000"))
+GEMINI_DAILY_REQUESTS = int(os.environ.get("GEMINI_DAILY_REQUESTS", "450"))
+_usage_lock = threading.Lock()
+
+
+def _pacific_now():
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo("America/Los_Angeles"))
+
+
+def _usage_path(site_dir):
+    return Path(site_dir) / "translations" / "usage.json"
+
+
+def load_usage(site_dir):
+    try:
+        return json.loads(_usage_path(site_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _charge(site_dir, engine, amount):
+    """Adds `amount` (Google: characters, Gemini: requests) to the engine's
+    counter for the current period, or raises LimitReached without adding
+    anything if that would pass the cap."""
+    now = _pacific_now()
+    if engine == "gemini":
+        period, limit, unit = now.strftime("%Y-%m-%d"), GEMINI_DAILY_REQUESTS, "requests"
+        msg = f"Gemini đã dùng hết {limit} lượt miễn phí hôm nay (đặt lại lúc 0h giờ Pacific)"
+    else:
+        period, limit, unit = now.strftime("%Y-%m"), GOOGLE_MONTHLY_CHARS, "chars"
+        msg = f"Google Translate đã chạm giới hạn {limit:,} ký tự tháng này"
+    with _usage_lock:
+        usage = load_usage(site_dir)
+        entry = usage.get(engine) or {}
+        used = entry.get(unit, 0) if entry.get("period") == period else 0
+        if used + amount > limit:
+            raise LimitReached(msg)
+        usage[engine] = {"period": period, unit: used + amount}
+        path = _usage_path(site_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(usage), encoding="utf-8")
+
+
+# ── Gemini ──────────────────────────────────────────────────────────────────
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+_GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models"
+_LANG_NAMES = {"en": "English", "zh": "Chinese", "vi": "Vietnamese"}
+
+
+def gemini_glossary(site_dir, book_id, source, target):
+    """([(term, translation)], revision) for Gemini: the shared terms plus
+    the book's (the book's win), with the same variants Google gets, longest
+    first. The revision is a hash of exactly that list, so editing another
+    book's terms doesn't re-translate this one."""
+    if target != GLOSSARY_TARGET:
+        return [], ""
+    terms = load_glossary(site_dir).get("terms", [])
+    shared = {t["source"]: t["target"] for t in terms if t["book_id"] is None and term_language(t["source"]) == source}
+    own = {t["source"]: t["target"] for t in terms if t["book_id"] == book_id and term_language(t["source"]) == source}
+    merged = {**_with_variants(shared), **_with_variants(own)}
+    entries = sorted(merged.items(), key=lambda kv: (-len(kv[0]), kv[0]))
+    revision = _content_hash(json.dumps(entries, ensure_ascii=False)) if entries else ""
+    return entries, revision
+
+
+def gemini_translate(texts, source, target, glossary=None):
+    """One generateContent call: a JSON array of paragraphs in, the same-length
+    array of translations out. `glossary` is gemini_glossary()'s list; only
+    the terms that occur in `texts` go into the prompt."""
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise TranslationError("GEMINI_API_KEY is not set")
+    joined = "\n".join(texts)
+    used = [(s, t) for s, t in (glossary or []) if s in joined]
+    instruction = (
+        f"You translate web novel text from {_LANG_NAMES.get(source, source)} to {_LANG_NAMES.get(target, target)}. "
+        "The input is a JSON array of paragraphs; answer with a JSON array of exactly the same length where "
+        "element i is the translation of paragraph i. Natural, fluent prose; keep the paragraph's own "
+        "punctuation, brackets and numbers; never merge, split, skip or comment."
+    )
+    if used:
+        instruction += (
+            " Glossary — whenever a term appears (case-sensitive), use exactly its translation; a term mapped "
+            "to itself stays untranslated:\n" + "\n".join(f"{s} => {t or s}" for s, t in used)
+        )
+    body = {
+        "systemInstruction": {"parts": [{"text": instruction}]},
+        "contents": [{"role": "user", "parts": [{"text": json.dumps(texts, ensure_ascii=False)}]}],
+        "generationConfig": {
+            "temperature": 0.3,
+            "responseMimeType": "application/json",
+            "responseSchema": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "thinkingConfig": {"thinkingLevel": "minimal"},
+        },
+    }
+    resp = requests.post(
+        f"{_GEMINI_API}/{GEMINI_MODEL}:generateContent", json=body, headers={"x-goog-api-key": key}, timeout=120
+    )
+    if resp.status_code == 429:
+        raise LimitReached("Gemini đang quá giới hạn miễn phí (15 lượt/phút, 500 lượt/ngày) — thử lại sau")
+    if not resp.ok:
+        raise TranslationError(f"Gemini generateContent failed: {resp.status_code} {resp.text[:300]}")
+    try:
+        out = json.loads(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+    except (KeyError, IndexError, ValueError) as e:
+        raise TranslationError(f"Gemini returned no usable answer: {e}")
+    if not isinstance(out, list) or len(out) != len(texts) or not all(isinstance(t, str) for t in out):
+        raise TranslationError("Gemini returned an unexpected number of translations")
+    return out
+
+
+ENGINES = ("google", "gemini")
+
+
+def _chapter_path(site_dir, book_id, chapter, source, target, engine="google"):
+    pair = f"{source}-{target}" + ("" if engine == "google" else f"-{engine}")
+    return Path(site_dir) / "translations" / str(book_id) / pair / f"{chapter:04d}.json"
 
 
 def _load_chapter(path):
@@ -446,16 +585,23 @@ def _load_chapter(path):
         return {"entries": {}}
 
 
-def translate_segments(site_dir, book_id, chapter, texts, source, target, translate_fn=None, glossary_fn=None):
+def translate_segments(
+    site_dir, book_id, chapter, texts, source, target, translate_fn=None, glossary_fn=None, engine="google"
+):
     """Translations for `texts` (aligned), serving whatever's already stored
     for this chapter and translating + storing only the rest. Returns
-    (translations, {"cached": n, "translated": n, "glossary": revision})."""
-    translate_fn = translate_fn or google_translate
-    glossary_fn = glossary_fn or resolve_glossary
+    (translations, {"cached": n, "translated": n, "glossary": revision}).
+    Raises LimitReached when the missing part would pass the engine's cap."""
+    if engine == "gemini":
+        translate_fn = translate_fn or gemini_translate
+        glossary_fn = glossary_fn or (lambda b, s, t: gemini_glossary(site_dir, b, s, t))
+    else:
+        translate_fn = translate_fn or google_translate
+        glossary_fn = glossary_fn or resolve_glossary
     glossary, revision = glossary_fn(book_id, source, target)
     rev_tag = revision or ""
 
-    path = _chapter_path(site_dir, book_id, chapter, source, target)
+    path = _chapter_path(site_dir, book_id, chapter, source, target, engine)
     stored = _load_chapter(path)
     entries = stored.get("entries", {})
 
@@ -473,10 +619,13 @@ def translate_segments(site_dir, book_id, chapter, texts, source, target, transl
 
     if missing:
         keys = list(missing)
+        _charge(site_dir, engine, 1 if engine == "gemini" else sum(len(missing[k]) for k in keys))
         try:
             translated = translate_fn([missing[k] for k in keys], source, target, glossary)
         except TranslationError:
-            if not glossary:
+            # Only Google's glossary can be mid-republish; a Gemini failure
+            # wouldn't be any different without the glossary.
+            if not glossary or engine != "google":
                 raise
             # The glossary may be mid-republish (deleted, not yet re-created)
             # — translate without it rather than fail. Stored with no
@@ -495,7 +644,7 @@ def translate_segments(site_dir, book_id, chapter, texts, source, target, transl
                 "chapter": chapter,
                 "source": source,
                 "target": target,
-                "engine": "google-v3-nmt",
+                "engine": GEMINI_MODEL if engine == "gemini" else "google-v3-nmt",
                 "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             }
         )

@@ -410,8 +410,10 @@ def translate_api():
     texts = body.get("texts")
     source = body.get("source") or "en"
     target = body.get("target") or "vi"
+    engine = body.get("engine") or "google"
     if (
-        not isinstance(book_id, int)
+        engine not in translation.ENGINES
+        or not isinstance(book_id, int)
         or not isinstance(chapter, int)
         or not isinstance(texts, list)
         or not all(isinstance(t, str) for t in texts)
@@ -425,7 +427,11 @@ def translate_api():
     ):
         return Response("Too many segments in one request", 413)
     try:
-        translations, stats = translation.translate_segments(SITE_DIR, book_id, chapter, texts, source, target)
+        translations, stats = translation.translate_segments(
+            SITE_DIR, book_id, chapter, texts, source, target, engine=engine
+        )
+    except translation.LimitReached as e:
+        return Response(str(e), 429)
     except translation.TranslationError as e:
         app.logger.error("translate failed: %s", e)
         return Response(str(e), 502)

@@ -881,17 +881,21 @@
     );
   }
 
-  async function postTranslate(num, source, texts) {
+  async function postTranslate(num, source, texts, engine = 'google') {
     const resp = await fetch('/api/translate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ book_id: parseInt(bookId, 10), chapter: num, source, target: TRANSLATE_TARGET, texts }),
+      body: JSON.stringify({ book_id: parseInt(bookId, 10), chapter: num, source, target: TRANSLATE_TARGET, texts, engine }),
     });
+    // 429 = a soft cap (server says which, in Vietnamese).
+    if (resp.status === 429) throw new Error(await resp.text());
     if (!resp.ok) throw new Error(`translate failed: ${resp.status}`);
     return (await resp.json()).translations;
   }
 
-  async function googleTranslate(container, num) {
+  // Same flow for Gemini (engine = 'gemini'): server-side, stored and shared
+  // like Google's, glossary sent in the prompt.
+  async function googleTranslate(container, num, engine = 'google') {
     const nodes = translatableNodes(container);
     const texts = nodes.map((node) => node.textContent.replace(/\s+/g, ' ').trim());
     const source = detectSourceLanguage(texts.join(' '));
@@ -912,9 +916,9 @@
     if (current.length) chunks.push(current);
 
     const t0 = performance.now();
-    const results = await Promise.all(chunks.map((idxs) => postTranslate(num, source, idxs.map((i) => texts[i]))));
+    const results = await Promise.all(chunks.map((idxs) => postTranslate(num, source, idxs.map((i) => texts[i]), engine)));
     chunks.forEach((idxs, c) => idxs.forEach((i, k) => (nodes[i].textContent = results[c][k])));
-    console.log(`reader.js: translated ${texts.length} paragraphs (${source}→${TRANSLATE_TARGET}) in ${(performance.now() - t0).toFixed(0)}ms`);
+    console.log(`reader.js: ${engine}-translated ${texts.length} paragraphs (${source}→${TRANSLATE_TARGET}) in ${(performance.now() - t0).toFixed(0)}ms`);
   }
 
   // ── Browser's on-device translator (Chrome's Translator API) ──────────────
@@ -1039,6 +1043,11 @@
       name: 'Google Translate',
       needsTranslation: (text) => detectSourceLanguage(text) !== null,
       translate: googleTranslate,
+    },
+    gemini: {
+      name: 'Gemini Flash-Lite (miễn phí, 500 lượt/ngày)',
+      needsTranslation: (text) => detectSourceLanguage(text) !== null,
+      translate: (container, num) => googleTranslate(container, num, 'gemini'),
     },
     browser: {
       name: 'Trình duyệt (offline, miễn phí)',
@@ -1229,7 +1238,7 @@
       // treats segments stored under the old one as missing; the browser
       // engine just re-reads the list).
       browserGlossaryPromise = null;
-      if (showingTranslation && ['google', 'browser'].includes(localStorage.getItem('reader.translateEngine'))) {
+      if (showingTranslation && ['google', 'gemini', 'browser'].includes(localStorage.getItem('reader.translateEngine'))) {
         chapterTranslatedHtml = null;
         rerenderChapter(true);
       }
@@ -2104,7 +2113,7 @@
           ${Object.entries(TRANSLATION_ENGINES).map(([key, e]) => `<option value="${key}">${e.name}</option>`).join('')}
         </select>
       </label>
-      <button type="button" class="dl-btn" data-role="glossaryOpen" title="Thuật ngữ cố định khi dịch bằng Google Translate hoặc trình duyệt">Glossary…</button>
+      <button type="button" class="dl-btn" data-role="glossaryOpen" title="Thuật ngữ cố định khi dịch bằng Google Translate, Gemini hoặc trình duyệt">Glossary…</button>
       <div class="reader-settings-heading">Lọc</div>
       <button type="button" class="dl-btn" data-role="filterWordsOpen" title="Bỏ link, quảng cáo, ghi chú… khỏi chương — không hiển thị, không đọc">Filter Words…</button>
       <label class="reader-settings-checkbox">
