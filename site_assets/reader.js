@@ -867,6 +867,16 @@
   const TRANSLATE_TARGET = 'vi';
   const TRANSLATE_CHUNK_SEGMENTS = 80;
   const TRANSLATE_CHUNK_CHARS = 20000;
+  // Like the app's GoogleCloudTranslationEngine: chunks go out in parallel
+  // and each one shows as soon as it's back, the first kept small so the
+  // start of the chapter appears quickly. Google uses the app's 40/8000
+  // chunks; Gemini keeps the bigger ones after the first — it's charged
+  // per request (free tier: 500/day).
+  const TRANSLATE_FIRST_CHUNK_SEGMENTS = 8;
+  const TRANSLATE_CHUNK_LIMITS = {
+    google: { segments: 40, chars: 8000 },
+    gemini: { segments: TRANSLATE_CHUNK_SEGMENTS, chars: TRANSLATE_CHUNK_CHARS },
+  };
   const VI_CHARS = /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/gi;
 
   // Source language of a chapter, or null when it's already Vietnamese.
@@ -901,17 +911,21 @@
 
   // Same flow for Gemini (engine = 'gemini'): server-side, stored and shared
   // like Google's, glossary sent in the prompt.
-  async function googleTranslate(container, num, engine = 'google') {
+  // `onParagraph(i, text)`, when given, is called as paragraph i of
+  // translatableNodes(container) gets its translation (same for every engine).
+  async function googleTranslate(container, num, engine = 'google', onParagraph) {
     const nodes = translatableNodes(container);
     const texts = nodes.map((node) => node.textContent.replace(/\s+/g, ' ').trim());
     const source = detectSourceLanguage(texts.join(' '));
     if (!source) return;
 
+    const limits = TRANSLATE_CHUNK_LIMITS[engine] || TRANSLATE_CHUNK_LIMITS.google;
     const chunks = [];
     let current = [];
     let chars = 0;
     texts.forEach((text, i) => {
-      if (current.length && (current.length >= TRANSLATE_CHUNK_SEGMENTS || chars + text.length > TRANSLATE_CHUNK_CHARS)) {
+      const maxSegments = chunks.length ? limits.segments : TRANSLATE_FIRST_CHUNK_SEGMENTS;
+      if (current.length && (current.length >= maxSegments || chars + text.length > limits.chars)) {
         chunks.push(current);
         current = [];
         chars = 0;
@@ -922,8 +936,15 @@
     if (current.length) chunks.push(current);
 
     const t0 = performance.now();
-    const results = await Promise.all(chunks.map((idxs) => postTranslate(num, source, idxs.map((i) => texts[i]), engine)));
-    chunks.forEach((idxs, c) => idxs.forEach((i, k) => (nodes[i].textContent = results[c][k])));
+    await Promise.all(
+      chunks.map(async (idxs) => {
+        const result = await postTranslate(num, source, idxs.map((i) => texts[i]), engine);
+        idxs.forEach((i, k) => {
+          nodes[i].textContent = result[k];
+          if (onParagraph) onParagraph(i, result[k]);
+        });
+      })
+    );
     console.log(`reader.js: ${engine}-translated ${texts.length} paragraphs (${source}→${TRANSLATE_TARGET}) in ${(performance.now() - t0).toFixed(0)}ms`);
   }
 
@@ -1021,7 +1042,7 @@
     return text.replace(/XQ\s?(\d+)\s?Z/gi, (whole, n) => (used[n] != null ? used[n] : whole));
   }
 
-  async function browserTranslate(container) {
+  async function browserTranslate(container, num, onParagraph) {
     const nodes = translatableNodes(container);
     const texts = nodes.map((node) => node.textContent.replace(/\s+/g, ' ').trim());
     const source = detectSourceLanguage(texts.join(' '));
@@ -1032,6 +1053,8 @@
     for (let i = 0; i < nodes.length; i++) {
       const { text, used } = protectTerms(texts[i], terms);
       nodes[i].textContent = restoreTerms(await translator.translate(text), used);
+      // false = the reader has moved on; no point translating the rest.
+      if (onParagraph && onParagraph(i, nodes[i].textContent) === false) return;
     }
     console.log(`reader.js: browser-translated ${texts.length} paragraphs (${source}→${TRANSLATE_TARGET}) in ${(performance.now() - t0).toFixed(0)}ms`);
   }
@@ -1053,12 +1076,12 @@
     google: {
       name: 'Google Translate (cloud)',
       needsTranslation: (text) => detectSourceLanguage(text) !== null,
-      translate: googleTranslate,
+      translate: (container, num, onParagraph) => googleTranslate(container, num, 'google', onParagraph),
     },
     gemini: {
       name: 'Gemini Flash-Lite (free, 500/day)',
       needsTranslation: (text) => detectSourceLanguage(text) !== null,
-      translate: (container, num) => googleTranslate(container, num, 'gemini'),
+      translate: (container, num, onParagraph) => googleTranslate(container, num, 'gemini', onParagraph),
     },
   };
 
@@ -1602,8 +1625,9 @@
   }
 
   // `html` translated by the current engine, or null if the chapter
-  // doesn't need it. Throws if the engine fails.
-  async function translateHtml(html, num) {
+  // doesn't need it. Throws if the engine fails. `onParagraph` — see
+  // googleTranslate.
+  async function translateHtml(html, num, onParagraph) {
     const engine = currentTranslationEngine();
     if (!engine.needsTranslation(textOfHtml(html))) return null;
     const tmp = document.createElement('div');
@@ -1613,14 +1637,29 @@
     // ad line — can't match once it's been translated into Vietnamese, and
     // there's no point paying to translate text that won't be shown anyway.
     applyFilterWords(tmp);
-    await engine.translate(tmp, num);
+    await engine.translate(tmp, num, onParagraph);
     return tmp.innerHTML;
+  }
+
+  // Set while renderChapterContent runs — the article may be filling in
+  // paragraph by paragraph, so start() waits for it rather than split a
+  // half-translated chapter into sentences.
+  let chapterRendering = null;
+
+  async function renderChapterContent() {
+    const rendering = fillChapterContent();
+    chapterRendering = rendering;
+    try {
+      await rendering;
+    } finally {
+      if (chapterRendering === rendering) chapterRendering = null;
+    }
   }
 
   // (Re)fills <article> from chapterOriginalHtml — translated if
   // showingTranslation. If the engine fails (dictionary/network) the
   // original text stays up and the error shows in the settings panel.
-  async function renderChapterContent() {
+  async function fillChapterContent() {
     const article = document.querySelector('article');
     const generation = ++renderGeneration;
     article.innerHTML = chapterOriginalHtml;
@@ -1628,10 +1667,22 @@
     if (!showingTranslation) return;
     if (chapterTranslatedHtml == null) {
       if (els) els.translateToggle.classList.add('busy');
+      // Shown as it's translated, like the app: each paragraph replaces its
+      // original as soon as its translation lands. The article holds the
+      // same filtered HTML translateHtml translates, so the paragraphs line
+      // up one to one.
+      const liveNodes = translatableNodes(article);
+      const showParagraph = (i, text) => {
+        if (generation !== renderGeneration) return false;
+        if (liveNodes[i]) liveNodes[i].textContent = text;
+      };
       try {
-        chapterTranslatedHtml = await translateHtml(chapterOriginalHtml, currentChapterNum);
+        chapterTranslatedHtml = await translateHtml(chapterOriginalHtml, currentChapterNum, showParagraph);
       } catch (e) {
         if (generation !== renderGeneration) return;
+        // Paragraphs that landed before the failure go back to the original.
+        article.innerHTML = chapterOriginalHtml;
+        applyFilterWords(article);
         showingTranslation = false;
         updateTranslateBtn();
         showReaderError(`Couldn't translate this chapter — showing the original. (${(e && e.message) || e})`);
@@ -1852,6 +1903,10 @@
   }
 
   function start() {
+    if (chapterRendering) {
+      chapterRendering.catch(() => {}).then(() => !active && start());
+      return;
+    }
     if (!sentences.length) {
       sentences = wrapContentSentences(document.querySelector('article'));
     }
