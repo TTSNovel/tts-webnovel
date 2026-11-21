@@ -522,6 +522,16 @@ def gemini_glossary(site_dir, book_id, source, target):
     return entries, revision
 
 
+def _occurs(term, text):
+    """`term` appears in `text` as a whole word — "F" (a grade) mustn't
+    match inside "Fifth". Case-sensitive, like Google's glossary matching."""
+    if term not in text:
+        return False
+    left = r"(?<![A-Za-z0-9])" if term[0].isalnum() else ""
+    right = r"(?![A-Za-z0-9])" if term[-1].isalnum() else ""
+    return re.search(left + re.escape(term) + right, text) is not None
+
+
 def gemini_translate(texts, source, target, glossary=None):
     """One generateContent call: a JSON array of paragraphs in, the same-length
     array of translations out. `glossary` is gemini_glossary()'s list; only
@@ -530,7 +540,7 @@ def gemini_translate(texts, source, target, glossary=None):
     if not key:
         raise TranslationError("GEMINI_API_KEY is not set")
     joined = "\n".join(texts)
-    used = [(s, t) for s, t in (glossary or []) if s in joined]
+    used = [(s, t) for s, t in (glossary or []) if _occurs(s, joined)]
     instruction = (
         f"You translate web novel text from {_LANG_NAMES.get(source, source)} to {_LANG_NAMES.get(target, target)}. "
         "The input is a JSON array of paragraphs; answer with a JSON array of exactly the same length where "

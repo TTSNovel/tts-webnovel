@@ -300,8 +300,10 @@ def test_gemini_translate_sends_only_terms_in_the_text(monkeypatch):
 
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     monkeypatch.setattr(translation.requests, "post", fake_post)
-    out = translation.gemini_translate(["The Rune.", "Hi."], "en", "vi", [("Rune", "Phù Văn"), ("Dao", "Đạo")])
+    glossary = [("Rune", "Phù Văn"), ("Dao", "Đạo"), ("F", "F")]
+    out = translation.gemini_translate(["The Rune.", "Fifth."], "en", "vi", glossary)
     assert out == ["a", "b"]
     instruction = sent["body"]["systemInstruction"]["parts"][0]["text"]
     assert "Rune => Phù Văn" in instruction and "Dao =>" not in instruction
+    assert "F => F" not in instruction  # only inside "Fifth"
     assert sent["headers"] == {"x-goog-api-key": "k"}
