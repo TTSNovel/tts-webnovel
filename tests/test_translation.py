@@ -228,3 +228,80 @@ def test_save_glossary_keeps_terms_when_publish_fails(tmp_path):
         translation.save_glossary(tmp_path, [{"source": "Dao", "target": "Đạo"}], Broken())
     stored = translation.load_glossary(tmp_path)
     assert [t["source"] for t in stored["terms"]] == ["Dao"] and stored["published"] == {}
+
+
+def test_google_monthly_soft_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(translation, "GOOGLE_MONTHLY_CHARS", 10)
+    fake = FakeGoogle()
+    run(tmp_path, fake, ["Hello."])  # 6 chars
+    with pytest.raises(translation.LimitReached):
+        run(tmp_path, fake, ["World."])  # would be 12
+    assert len(fake.calls) == 1
+    # Already-stored segments cost nothing, so they still come back.
+    out, _ = run(tmp_path, fake, ["Hello."])
+    assert out == ["vi:Hello."]
+    # A new month starts from zero.
+    usage = translation.load_usage(tmp_path)
+    usage["google"]["period"] = "2000-01"
+    (tmp_path / "translations" / "usage.json").write_text(json.dumps(usage))
+    run(tmp_path, fake, ["World."])
+    assert len(fake.calls) == 2
+
+
+def test_gemini_engine_uses_its_own_store_glossary_and_daily_cap(tmp_path, monkeypatch):
+    translation.save_glossary(
+        tmp_path,
+        [
+            {"source": "Strength", "target": "Sức Mạnh", "book_id": None},
+            {"source": "Dexterity", "target": "Nhanh Nhẹn", "book_id": None},
+            {"source": "Dexterity", "target": "Khéo Léo", "book_id": 119},
+            {"source": "Rune", "target": "Phù Văn", "book_id": 148},
+        ],
+        google=type("G", (), {"list_ids": lambda self: [], "create": lambda *a: None, "delete": lambda *a: None})(),
+    )
+    monkeypatch.setattr(translation, "GEMINI_DAILY_REQUESTS", 2)
+    calls = []
+
+    def fake_gemini(texts, source, target, glossary):
+        calls.append((list(texts), dict(glossary)))
+        return [f"gm:{t}" for t in texts]
+
+    def go(texts):
+        return translation.translate_segments(tmp_path, 119, 3, texts, "en", "vi", translate_fn=fake_gemini, engine="gemini")
+
+    out, _ = go(["Dexterity rose.", "Strength too."])
+    assert out == ["gm:Dexterity rose.", "gm:Strength too."]
+    glossary = calls[0][1]
+    assert glossary["Dexterity"] == "Khéo Léo"  # the book's own term wins
+    assert glossary["Strengths"] == "Sức Mạnh"  # variants like Google's
+    assert "Rune" not in glossary  # another book's term
+    assert (tmp_path / "translations" / "119" / "en-vi-gemini" / "0003.json").exists()
+    assert not (tmp_path / "translations" / "119" / "en-vi" / "0003.json").exists()
+
+    go(["Dexterity rose."])  # stored: no request
+    go(["Again."])
+    with pytest.raises(translation.LimitReached):
+        go(["Once more."])
+    assert len(calls) == 2
+
+
+def test_gemini_translate_sends_only_terms_in_the_text(monkeypatch):
+    sent = {}
+
+    class Resp:
+        status_code, ok = 200, True
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": json.dumps(["a", "b"])}]}}]}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        sent.update(url=url, body=json, headers=headers)
+        return Resp()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setattr(translation.requests, "post", fake_post)
+    out = translation.gemini_translate(["The Rune.", "Hi."], "en", "vi", [("Rune", "Phù Văn"), ("Dao", "Đạo")])
+    assert out == ["a", "b"]
+    instruction = sent["body"]["systemInstruction"]["parts"][0]["text"]
+    assert "Rune => Phù Văn" in instruction and "Dao =>" not in instruction
+    assert sent["headers"] == {"x-goog-api-key": "k"}
